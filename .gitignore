@@ -1,0 +1,7 @@
+.pio/
+.venv/
+voices/
+server/data/
+__pycache__/
+*.pyc
+.DS_Store
