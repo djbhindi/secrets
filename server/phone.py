@@ -7,20 +7,18 @@ from itertools import product
 from pathlib import Path
 import re
 import secrets
+import socket
 import struct
 import sys
 import time
 import wave
 
-import serial
-from serial.tools import list_ports
-
-
 RATE = 16000
 RECORD_SECONDS = 10
 MENU_REPEAT_SECONDS = 15
 VOICE_GAIN = 0.08
-PLAY_CHUNK_BYTES = 128 * 2
+PLAY_CHUNK_BYTES = 256 * 2
+PHONE_PORT = 45679
 DIGITS = "123456789"
 DIALED = re.compile(r"^DIALED ([1-9]) \(\d+ edges; turn (\d+)\)$")
 TRIGGER = re.compile(r"^TRIGGER \(20 edges; turn (\d+)\)$")
@@ -35,12 +33,53 @@ class Hangup(Exception):
     """The handset was placed on the cradle during an operation."""
 
 
+class SocketPort:
+    """Provide the small stream interface used by Phone over a TCP socket."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.buffer = bytearray()
+
+    def _receive(self):
+        try:
+            chunk = self.connection.recv(4096)
+        except socket.timeout:
+            return False
+        if not chunk:
+            raise ConnectionError("ESP32 disconnected")
+        self.buffer.extend(chunk)
+        return True
+
+    def read(self, count):
+        if not self.buffer and not self._receive():
+            return b""
+        result = bytes(self.buffer[:count])
+        del self.buffer[:count]
+        return result
+
+    def readline(self):
+        while b"\n" not in self.buffer:
+            if not self._receive():
+                return b""
+        end = self.buffer.index(10) + 1
+        result = bytes(self.buffer[:end])
+        del self.buffer[:end]
+        return result
+
+    def write(self, data):
+        self.connection.sendall(data)
+        return len(data)
+
+    def flush(self):
+        pass
+
+
 def read_exact(port, count):
     result = bytearray()
     while len(result) < count:
         chunk = port.read(count - len(result))
         if not chunk:
-            raise TimeoutError(f"USB audio stopped after {len(result)} of {count} bytes")
+            raise TimeoutError(f"Audio stream stopped after {len(result)} of {count} bytes")
         result.extend(chunk)
     return bytes(result)
 
@@ -286,14 +325,17 @@ class Phone:
         return True
 
     def run(self):
-        # Opening a USB serial port may reset the ESP32.
-        time.sleep(2)
-        self.port.reset_input_buffer()
+        self.pending.clear()
+        self.offhook = False
+        self.entered = ""
+        self.menu_repeat_at = None
+        self.last_turn_id = 0
         self.command("H")
         self.port.flush()
         self.wait_for("HOST MODE", seconds=8)
-        self.pending.clear()  # Ignore events emitted while the Mac was starting.
-        self.load_clips()
+        self.pending.clear()
+        if not self.clips:
+            self.load_clips()
         print("Phone ready. Put the handset down, then lift it to begin.", flush=True)
         while True:
             line = self.pending.popleft() if self.pending else self.line()
@@ -316,22 +358,25 @@ class Phone:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", help="ESP32 USB serial port; auto-detected when omitted")
+    parser.add_argument("--host", default="192.168.4.1",
+                        help="ESP32 Wi-Fi address (default: ESP32 access point)")
+    parser.add_argument("--port", type=int, default=PHONE_PORT,
+                        help="ESP32 TCP port")
     parser.add_argument("--messages", type=Path,
                         default=SERVER_DIR / "data" / "messages")
     args = parser.parse_args()
-    port_name = args.port or discover_port()
-    with serial.Serial(port_name, 460800, timeout=2, write_timeout=60) as port:
-        Phone(port, args.messages).run()
-
-
-def discover_port():
-    candidates = [port.device for port in list_ports.comports() if port.vid is not None]
-    if len(candidates) == 1:
-        return candidates[0]
-    if not candidates:
-        raise RuntimeError("No USB serial device found. Plug in the ESP32 or pass --port.")
-    raise RuntimeError("Several USB serial devices found; pass --port: " + ", ".join(candidates))
+    phone = Phone(None, args.messages)
+    while True:
+        try:
+            with socket.create_connection((args.host, args.port), timeout=3) as connection:
+                connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                connection.settimeout(2)
+                phone.port = SocketPort(connection)
+                print(f"Connected to phone at {args.host}:{args.port}", flush=True)
+                phone.run()
+        except (ConnectionError, TimeoutError, OSError) as error:
+            print(f"Phone connection lost: {error}. Retrying...", flush=True)
+            time.sleep(2)
 
 
 if __name__ == "__main__":

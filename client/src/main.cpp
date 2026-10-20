@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include <driver/i2s.h>
 #include <driver/adc.h>
 #include <driver/rtc_io.h>
@@ -6,6 +7,14 @@
 #include <soc/i2s_reg.h>
 #include <soc/soc.h>
 #include "prompt_pcm.h"
+#include "network_config.h"
+
+#ifndef PHONE_CRADLE_PIN
+#define PHONE_CRADLE_PIN 32
+#endif
+#if PHONE_CRADLE_PIN != 4 && PHONE_CRADLE_PIN != 32
+#error "PHONE_CRADLE_PIN must be GPIO4 or GPIO32"
+#endif
 
 // GPIO pins used for the DOIT ESP32 DEVKIT V1 microphone wiring.
 constexpr int PIN_BCLK = 25;
@@ -14,7 +23,7 @@ constexpr int PIN_DATA = 33;
 constexpr int PIN_SPEAKER_BCLK = 14;
 constexpr int PIN_SPEAKER_WS = 27;
 constexpr int PIN_SPEAKER_DATA = 22;
-constexpr int PIN_CRADLE = 4;
+constexpr int PIN_CRADLE = PHONE_CRADLE_PIN;
 constexpr int PIN_DIAL_RR = 5;
 constexpr uint32_t DIAL_SETTLE_US = 250000;
 // Settled readings on this phone: handset up ~150, down ~3900-4095.
@@ -30,8 +39,12 @@ constexpr int SAMPLE_RATE = 32000;
 constexpr int RECORD_RATE = SAMPLE_RATE / 2;
 constexpr uint32_t HOST_RECORD_SAMPLES = RECORD_RATE * 10;
 constexpr size_t FRAMES_PER_READ = 256;
-constexpr size_t HOST_PLAY_FRAMES = 128;
+constexpr size_t HOST_PLAY_FRAMES = 256;
 constexpr float PROMPT_GAIN = 0.08f;
+constexpr uint16_t PHONE_PORT = 45679;
+
+WiFiServer phone_server(PHONE_PORT);
+WiFiClient phone_client;
 
 int32_t samples[FRAMES_PER_READ * 2]; // left, right, repeated
 int16_t recording_chunk[FRAMES_PER_READ / 2];
@@ -80,7 +93,7 @@ void pollDial() {
     dial_pending_edges += edges - dial_reported_edges;
     dial_reported_edges = edges;
     dial_reported_level = level;
-    Serial.printf("Dial RR: %s; edges: %lu\n",
+    phone_client.printf("Dial RR: %s; edges: %lu\n",
                   level == LOW ? "GROUNDED" : "OPEN",
                   static_cast<unsigned long>(edges));
   }
@@ -91,16 +104,16 @@ void pollDial() {
   dial_pending_edges = 0;
   ++dial_turn_id;
   if (turn_edges == 20) {
-    Serial.printf("TRIGGER (%lu edges; turn %lu)\n",
+    phone_client.printf("TRIGGER (%lu edges; turn %lu)\n",
                   static_cast<unsigned long>(turn_edges),
                   static_cast<unsigned long>(dial_turn_id));
   } else if (turn_edges >= 2 && turn_edges <= 18 && turn_edges % 2 == 0) {
-    Serial.printf("DIALED %lu (%lu edges; turn %lu)\n",
+    phone_client.printf("DIALED %lu (%lu edges; turn %lu)\n",
                   static_cast<unsigned long>(turn_edges / 2),
                   static_cast<unsigned long>(turn_edges),
                   static_cast<unsigned long>(dial_turn_id));
   } else {
-    Serial.printf("Dial unrecognized (%lu edges; turn %lu)\n",
+    phone_client.printf("Dial unrecognized (%lu edges; turn %lu)\n",
                   static_cast<unsigned long>(turn_edges),
                   static_cast<unsigned long>(dial_turn_id));
   }
@@ -108,15 +121,19 @@ void pollDial() {
 
 void pollCradle(bool report = true) {
   if (report && cradle_event_pending) {
-    Serial.printf("Cradle %s; ADC: %d\n",
+    phone_client.printf("Cradle %s; ADC: %d\n",
                   cradle_stable == LOW ? "DOWN" : "UP", cradle_adc);
     cradle_event_pending = false;
   }
   const unsigned long now = millis();
   if (now - cradle_sampled_at < 10) return;
   cradle_sampled_at = now;
-  if (adc2_get_raw(ADC2_CHANNEL_0, ADC_WIDTH_BIT_12, &cradle_adc) != ESP_OK)
-    return;
+  #if PHONE_CRADLE_PIN == 4
+  cradle_adc = digitalRead(PIN_CRADLE) == HIGH ? 4095 : 0;
+  #else
+  cradle_adc = adc1_get_raw(ADC1_CHANNEL_4);
+  #endif
+  if (cradle_adc < 0) return;
   int reading = cradle_raw;
   if (cradle_adc < CRADLE_UP_BELOW) reading = HIGH;
   if (cradle_adc > CRADLE_DOWN_ABOVE) reading = LOW;
@@ -133,7 +150,7 @@ void pollCradle(bool report = true) {
     cradle_stable = reading;
     if (reading == HIGH) dial_turn_at_lift = dial_turn_id;
     if (report) {
-      Serial.printf("Cradle %s; ADC: %d\n",
+      phone_client.printf("Cradle %s; ADC: %d\n",
                     reading == LOW ? "DOWN" : "UP", cradle_adc);
     } else {
       cradle_event_pending = true;
@@ -153,19 +170,28 @@ void discardMicStartup() {
   }
 }
 
+bool writeNetworkBytes(const uint8_t *source, size_t count) {
+  size_t sent = 0;
+  while (sent < count && phone_client.connected()) {
+    const size_t written = phone_client.write(source + sent, count - sent);
+    if (written == 0) return false;
+    sent += written;
+  }
+  return sent == count;
+}
+
 void recordHostAudio() {
   discardMicStartup();
   const uint32_t rate = RECORD_RATE;
-  Serial.write(reinterpret_cast<const uint8_t *>("REC1"), 4);
-  Serial.write(reinterpret_cast<const uint8_t *>(&rate), sizeof(rate));
+  if (!writeNetworkBytes(reinterpret_cast<const uint8_t *>("REC1"), 4) ||
+      !writeNetworkBytes(reinterpret_cast<const uint8_t *>(&rate), sizeof(rate))) return;
 
   uint16_t packet[FRAMES_PER_READ / 2 + 1] = {};
   uint32_t captured = 0;
   while (captured < HOST_RECORD_SAMPLES) {
     if (handsetDown(false)) {
       packet[0] = 0;
-      Serial.write(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
-      Serial.flush();
+      writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
       pollCradle();
       return;
     }
@@ -173,8 +199,7 @@ void recordHostAudio() {
     if (i2s_read(I2S_PORT, samples, sizeof(samples), &bytes_read,
                  portMAX_DELAY) != ESP_OK) {
       packet[0] = UINT16_MAX;
-      Serial.write(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
-      Serial.flush();
+      writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
       return;
     }
     const size_t frames = bytes_read / (2 * sizeof(int32_t));
@@ -187,19 +212,19 @@ void recordHostAudio() {
     }
     packet[0] = count;
     memcpy(&packet[1], recording_chunk, count * sizeof(int16_t));
-    Serial.write(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
+    if (!writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet),
+                           sizeof(packet))) return;
     captured += count;
   }
   packet[0] = 0;
-  Serial.write(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
-  Serial.flush();
+  writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
 }
 
-bool readSerialBytes(uint8_t *destination, size_t count) {
+bool readNetworkBytes(uint8_t *destination, size_t count) {
   size_t received = 0;
   while (received < count) {
-    const size_t chunk = Serial.readBytes(destination + received,
-                                          count - received);
+    const size_t chunk = phone_client.readBytes(destination + received,
+                                                count - received);
     if (chunk == 0) return false;
     received += chunk;
   }
@@ -208,9 +233,9 @@ bool readSerialBytes(uint8_t *destination, size_t count) {
 
 void playHostAudio() {
   uint32_t sample_count = 0;
-  if (!readSerialBytes(reinterpret_cast<uint8_t *>(&sample_count), 4) ||
+  if (!readNetworkBytes(reinterpret_cast<uint8_t *>(&sample_count), 4) ||
       sample_count == 0 || sample_count > RECORD_RATE * 30) {
-    Serial.println("PLAY ERROR");
+    phone_client.println("PLAY ERROR");
     return;
   }
   uint32_t played = 0;
@@ -218,21 +243,21 @@ void playHostAudio() {
     pollDial();
     if (handsetDown()) {
       i2s_zero_dma_buffer(SPEAKER_PORT);
-      Serial.println("ABORTED");
+      phone_client.println("ABORTED");
       return;
     }
     const size_t frames = min(static_cast<uint32_t>(HOST_PLAY_FRAMES),
                               sample_count - played);
-    Serial.println("NEXT"); // Let the computer send only one small chunk.
-    if (!readSerialBytes(reinterpret_cast<uint8_t *>(host_play_chunk),
+    phone_client.println("NEXT"); // Let the computer send only one small chunk.
+    if (!readNetworkBytes(reinterpret_cast<uint8_t *>(host_play_chunk),
                          frames * sizeof(int16_t))) {
-      Serial.println("PLAY ERROR");
+      phone_client.println("PLAY ERROR");
       return;
     }
     pollDial();
     if (handsetDown()) {
       i2s_zero_dma_buffer(SPEAKER_PORT);
-      Serial.println("ABORTED");
+      phone_client.println("ABORTED");
       return;
     }
     for (size_t frame = 0; frame < frames; ++frame) {
@@ -243,14 +268,14 @@ void playHostAudio() {
     if (i2s_write(SPEAKER_PORT, stereo_chunk, frames * 2 * sizeof(int16_t),
                   &written, portMAX_DELAY) != ESP_OK ||
         written != frames * 2 * sizeof(int16_t)) {
-      Serial.println("PLAY ERROR");
+      phone_client.println("PLAY ERROR");
       return;
     }
     played += frames;
   }
   delay(50);
   i2s_zero_dma_buffer(SPEAKER_PORT);
-  Serial.println(handsetDown() ? "ABORTED" : "PLAYED");
+  phone_client.println(handsetDown() ? "ABORTED" : "PLAYED");
 }
 
 bool playPcmBuffer(const int16_t *pcm, uint32_t sample_count, float gain,
@@ -285,7 +310,7 @@ bool playPcmBuffer(const int16_t *pcm, uint32_t sample_count, float gain,
     if (i2s_write(SPEAKER_PORT, stereo_chunk, frames * 2 * sizeof(int16_t),
                   &written, portMAX_DELAY) != ESP_OK ||
         written != frames * 2 * sizeof(int16_t)) {
-      Serial.println("SPEAKER ERROR");
+      phone_client.println("SPEAKER ERROR");
       return false;
     }
     played += frames;
@@ -306,9 +331,9 @@ void playMenu(bool include_intro) {
     finished = playPcmBuffer(PROMPT_MENU_PCM, prompt_samples,
                              PROMPT_GAIN, &dial_interrupted);
   }
-  if (finished) Serial.println(include_intro ? "MENU PLAYED" : "MENU REPEATED");
-  else if (dial_interrupted) Serial.println("MENU SKIPPED");
-  else if (cradle_stable == LOW) Serial.println("ABORTED");
+  if (finished) phone_client.println(include_intro ? "MENU PLAYED" : "MENU REPEATED");
+  else if (dial_interrupted) phone_client.println("MENU SKIPPED");
+  else if (cradle_stable == LOW) phone_client.println("ABORTED");
 }
 
 bool playBeep() {
@@ -350,10 +375,15 @@ void setup() {
   Serial.printf("Dial RR initial: %s\n",
                 digitalRead(PIN_DIAL_RR) == LOW ? "GROUNDED" : "OPEN");
   pinMode(PIN_CRADLE, INPUT_PULLUP);
-  adc2_config_channel_atten(ADC2_CHANNEL_0, ADC_ATTEN_DB_12);
-  rtc_gpio_pulldown_dis(GPIO_NUM_4);
-  rtc_gpio_pullup_en(GPIO_NUM_4);
-  adc2_get_raw(ADC2_CHANNEL_0, ADC_WIDTH_BIT_12, &cradle_adc);
+  #if PHONE_CRADLE_PIN == 32
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_12);
+  rtc_gpio_pulldown_dis(GPIO_NUM_32);
+  rtc_gpio_pullup_en(GPIO_NUM_32);
+  cradle_adc = adc1_get_raw(ADC1_CHANNEL_4);
+  #else
+  cradle_adc = digitalRead(PIN_CRADLE) == HIGH ? 4095 : 0;
+  #endif
   cradle_raw = cradle_stable = cradle_adc < CRADLE_UP_BELOW ? HIGH : LOW;
   cradle_changed_at = cradle_sampled_at = millis();
   Serial.printf("Cradle initial: %s; ADC: %d\n",
@@ -419,15 +449,26 @@ void setup() {
     while (true) delay(1000);
   }
   i2s_zero_dma_buffer(SPEAKER_PORT);
-  Serial.printf("Audio memory: prompt=flash, message=RAM; free heap: %u\n",
+  Serial.printf("Audio memory: prompt=flash, messages=streamed; free heap: %u\n",
                 ESP.getFreeHeap());
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                    IPAddress(255, 255, 255, 0));
+  if (!WiFi.softAP(PHONE_AP_SSID, PHONE_AP_PASSWORD)) {
+    Serial.println("Phone Wi-Fi access point failed");
+    while (true) delay(1000);
+  }
+  phone_server.begin();
+  Serial.printf("Phone Wi-Fi: %s at %s:%u; free heap: %u\n",
+                PHONE_AP_SSID, WiFi.softAPIP().toString().c_str(),
+                PHONE_PORT, ESP.getFreeHeap());
 }
 
-bool pollSerialCommand() {
+bool pollNetworkCommand() {
   bool consumed = false;
-  while (Serial.available()) {
+  while (phone_client.available()) {
     consumed = true;
-    const int incoming = Serial.read();
+    const int incoming = phone_client.read();
     if (incoming != '\n') {
       if (incoming >= 32 && incoming <= 126 &&
           command_length < sizeof(command_buffer) - 1) {
@@ -443,14 +484,14 @@ bool pollSerialCommand() {
         command_buffer[5] == '\0' || command_buffer[6] != '\0') continue;
     const char command = command_buffer[5];
     if (command == 'H') {
-      Serial.println("HOST MODE");
+      phone_client.println("HOST MODE");
     }
     if (command == 'o') playMenu(true);
     if (command == 'm') playMenu(false);
     if (command == 'R') recordHostAudio();
     if (command == 'P') playHostAudio();
     if (command == 'b') {
-      Serial.println(playBeep() ? "BEEPED" : "ABORTED");
+      phone_client.println(playBeep() ? "BEEPED" : "ABORTED");
     }
     return true;
   }
@@ -458,9 +499,30 @@ bool pollSerialCommand() {
 }
 
 void loop() {
+  if (!phone_client.connected()) {
+    phone_client.stop();
+    pollCradle(false);
+    WiFiClient next_client = phone_server.available();
+    if (next_client) {
+      phone_client = next_client;
+      phone_client.setNoDelay(true);
+      phone_client.setTimeout(3000);
+      command_length = 0;
+      cradle_event_pending = false;
+      noInterrupts();
+      dial_reported_edges = dial_edges;
+      interrupts();
+      dial_pending_edges = 0;
+      dial_turn_at_lift = dial_turn_id;
+      Serial.printf("Laptop connected from %s\n",
+                    phone_client.remoteIP().toString().c_str());
+    }
+    delay(10);
+    return;
+  }
   pollDial();
   pollCradle();
-  if (pollSerialCommand()) return;
+  if (pollNetworkCommand()) return;
 
   size_t bytes_read = 0;
   esp_err_t error = i2s_read(I2S_PORT, samples, sizeof(samples),

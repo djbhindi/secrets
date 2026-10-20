@@ -1,0 +1,8 @@
+#pragma once
+
+// Copy this file to network_config.h (which Git ignores) and choose a private
+// password of at least eight characters before flashing the ESP32.
+#define PHONE_AP_SSID "SecretsPhone"
+#define PHONE_AP_PASSWORD "replace-with-a-private-password"
+// Use 32 for an ADC1 cradle wire, or 4 for the original wiring with a digital read.
+#define PHONE_CRADLE_PIN 32

@@ -1,12 +1,14 @@
 import io
 from pathlib import Path
+import socket
 import struct
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 
-from server.phone import Hangup, Phone, RATE
+from server.phone import Hangup, Phone, RATE, SocketPort
 
 
 class FakePort:
@@ -29,6 +31,55 @@ class FakePort:
 
 
 class PhoneTests(unittest.TestCase):
+    def test_tcp_playback_streams_bounded_chunks(self):
+        left, right = socket.socketpair()
+        received = []
+
+        def device():
+            try:
+                self.assertEqual(right.recv(7), b"RPH1:P\n")
+                count = struct.unpack("<I", right.recv(4))[0]
+                self.assertEqual(count, 513)
+                for frames in (256, 256, 1):
+                    right.sendall(b"NEXT\n")
+                    chunk = bytearray()
+                    while len(chunk) < frames * 2:
+                        chunk.extend(right.recv(frames * 2 - len(chunk)))
+                    received.append(bytes(chunk))
+                right.sendall(b"PLAYED\n")
+            finally:
+                right.close()
+
+        worker = threading.Thread(target=device)
+        worker.start()
+        try:
+            left.settimeout(1)
+            with tempfile.TemporaryDirectory() as directory:
+                phone = Phone(SocketPort(left), Path(directory))
+                raw = bytes((index % 256 for index in range(513 * 2)))
+                phone.play(raw)
+                self.assertEqual(b"".join(received), raw)
+        finally:
+            left.close()
+            worker.join(timeout=2)
+
+    def test_tcp_stream_keeps_lines_and_audio_in_order(self):
+        left, right = socket.socketpair()
+        try:
+            left.settimeout(0.1)
+            port = SocketPort(left)
+            right.sendall(b"HOST MODE\n\x00\x01\x02")
+            self.assertEqual(port.readline(), b"HOST MODE\n")
+            self.assertEqual(port.read(3), b"\x00\x01\x02")
+            port.write(b"RPH1:P\n")
+            self.assertEqual(right.recv(7), b"RPH1:P\n")
+            right.close()
+            with self.assertRaises(ConnectionError):
+                port.read(1)
+        finally:
+            left.close()
+            right.close()
+
     def test_codes_are_unique_during_a_server_run(self):
         with tempfile.TemporaryDirectory() as directory:
             phone = Phone(None, Path(directory))

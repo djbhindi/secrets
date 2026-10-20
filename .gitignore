@@ -5,3 +5,4 @@ server/data/
 __pycache__/
 *.pyc
 .DS_Store
+client/include/network_config.h
