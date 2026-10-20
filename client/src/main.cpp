@@ -7,6 +7,7 @@
 #include <soc/i2s_reg.h>
 #include <soc/soc.h>
 #include "prompt_pcm.h"
+#include "voice_adpcm.h"
 #include "network_config.h"
 
 #ifndef PHONE_CRADLE_PIN
@@ -41,6 +42,7 @@ constexpr uint32_t HOST_RECORD_SAMPLES = RECORD_RATE * 10;
 constexpr size_t FRAMES_PER_READ = 256;
 constexpr size_t HOST_PLAY_FRAMES = 256;
 constexpr float PROMPT_GAIN = 0.08f;
+constexpr float VOICE_GAIN = 0.08f;
 constexpr uint16_t PHONE_PORT = 45679;
 
 WiFiServer phone_server(PHONE_PORT);
@@ -229,6 +231,84 @@ bool readNetworkBytes(uint8_t *destination, size_t count) {
     received += chunk;
   }
   return true;
+}
+
+// IMA ADPCM state resets for each prerecorded clip.
+constexpr int16_t ADPCM_STEP[] = {
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+    34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130,
+    143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408,
+    449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282,
+    1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327,
+    3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630,
+    9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350,
+    22385, 24623, 27086, 29794, 32767};
+constexpr int8_t ADPCM_INDEX[] = {-1, -1, -1, -1, 2, 4, 6, 8};
+
+int16_t decodeVoiceSample(const VoiceClip &clip, uint32_t position,
+                          int32_t &predictor, int &index) {
+  const uint8_t packed = clip.data[position / 2];
+  const uint8_t nibble = position & 1 ? packed >> 4 : packed & 0x0f;
+  const int step = ADPCM_STEP[index];
+  int change = step >> 3;
+  if (nibble & 4) change += step;
+  if (nibble & 2) change += step >> 1;
+  if (nibble & 1) change += step >> 2;
+  predictor += (nibble & 8) ? -change : change;
+  predictor = constrain(predictor, -32768, 32767);
+  index = constrain(index + ADPCM_INDEX[nibble & 7], 0, 88);
+  const uint32_t edge = min(position, clip.samples - position - 1);
+  const float fade = min(1.0f, edge / 160.0f);
+  return static_cast<int16_t>(predictor * VOICE_GAIN * fade);
+}
+
+void playVoiceClips() {
+  uint8_t count = 0;
+  if (!readNetworkBytes(&count, 1) || count == 0 || count > 16) {
+    phone_client.println("CLIPS ERROR");
+    return;
+  }
+  uint8_t clip_ids[16] = {};
+  if (!readNetworkBytes(clip_ids, count)) {
+    phone_client.println("CLIPS ERROR");
+    return;
+  }
+  for (uint8_t clip_number = 0; clip_number < count; ++clip_number) {
+    if (clip_ids[clip_number] >= VOICE_CLIP_COUNT) {
+      phone_client.println("CLIPS ERROR");
+      return;
+    }
+    const VoiceClip &clip = VOICE_CLIP_TABLE[clip_ids[clip_number]];
+    int32_t predictor = 0;
+    int index = 0;
+    for (uint32_t played = 0; played < clip.samples;) {
+      pollDial();
+      if (handsetDown()) {
+        i2s_zero_dma_buffer(SPEAKER_PORT);
+        phone_client.println("ABORTED");
+        return;
+      }
+      const size_t frames = min(static_cast<uint32_t>(FRAMES_PER_READ),
+                                clip.samples - played);
+      for (size_t frame = 0; frame < frames; ++frame) {
+        const int16_t value = decodeVoiceSample(clip, played + frame,
+                                                 predictor, index);
+        stereo_chunk[frame * 2] = value;
+        stereo_chunk[frame * 2 + 1] = value;
+      }
+      size_t written = 0;
+      if (i2s_write(SPEAKER_PORT, stereo_chunk, frames * 2 * sizeof(int16_t),
+                    &written, portMAX_DELAY) != ESP_OK ||
+          written != frames * 2 * sizeof(int16_t)) {
+        phone_client.println("SPEAKER ERROR");
+        return;
+      }
+      played += frames;
+    }
+  }
+  delay(50);
+  i2s_zero_dma_buffer(SPEAKER_PORT);
+  phone_client.println(handsetDown() ? "ABORTED" : "CLIPS PLAYED");
 }
 
 void playHostAudio() {
@@ -490,6 +570,7 @@ bool pollNetworkCommand() {
     if (command == 'm') playMenu(false);
     if (command == 'R') recordHostAudio();
     if (command == 'P') playHostAudio();
+    if (command == 'C') playVoiceClips();
     if (command == 'b') {
       phone_client.println(playBeep() ? "BEEPED" : "ABORTED");
     }

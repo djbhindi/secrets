@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from server.phone import Hangup, Phone, RATE, SocketPort
+from server.phone import Hangup, Phone, RATE, SocketPort, VOICE_CLIPS
 
 
 class FakePort:
@@ -88,16 +88,14 @@ class PhoneTests(unittest.TestCase):
             self.assertTrue(all(len(code) == 3 and "0" not in code for code in codes))
             self.assertIsNone(phone.available_key())
 
-    def test_code_announcement_joins_prerecorded_clips(self):
+    def test_code_announcement_plays_prerecorded_clips_on_esp32(self):
         with tempfile.TemporaryDirectory() as directory:
-            phone = Phone(None, Path(directory))
-            phone.load_clips()
-            played = []
-            phone.play = played.append
+            port = FakePort(b"CLIPS PLAYED\n")
+            phone = Phone(port, Path(directory))
             names = ("you_dialed", "digit_7", "digit_8", "digit_1", "no_message")
             phone.speak_clips(*names)
-            self.assertEqual(played, [b"".join(phone.clips[name] for name in names)])
-            self.assertGreater(len(played[0]), RATE * 2)
+            self.assertEqual(port.sent, b"RPH1:C\n" + bytes((len(names),))
+                             + bytes(VOICE_CLIPS.index(name) for name in names))
 
     def test_recording_uses_chunk_end_marker(self):
         raw = bytes(RATE * 10 * 2)

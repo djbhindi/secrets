@@ -1,11 +1,11 @@
 # Wireless rotary phone message system
 
-The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone, and drives a MAX98357A amplifier. It creates a local Wi-Fi network that the laptop joins. The laptop stores messages and plays prerecorded Cori speech clips. USB is needed to flash the ESP32 and can then be replaced with a USB wall adapter or power bank for power; phone audio and commands travel over Wi-Fi TCP.
+The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone, and drives a MAX98357A amplifier. It creates a local Wi-Fi network that the laptop joins. The opening menu and all reusable Cori speech clips are stored in ESP32 flash and play locally. The laptop stores callers' messages and streams those recordings when requested. USB is needed to flash the ESP32 and can then be replaced with a USB wall adapter or power bank for power; commands and caller audio travel over Wi-Fi TCP.
 
 ## Layout
 
-- `client/`: PlatformIO ESP32 firmware. The opening menu is embedded in flash.
-- `server/`: Laptop program and prerecorded voice clips. Messages are saved to `server/data/messages/`, which Git ignores.
+- `client/`: PlatformIO ESP32 firmware. The opening menu and reusable speech clips are embedded in flash.
+- `server/`: Laptop program and source WAV clips used to build the firmware. Messages are saved to `server/data/messages/`, which Git ignores.
 - `scripts/`: Optional tools to regenerate the voice and menu assets.
 - `tests/`: Laptop program tests.
 
@@ -45,17 +45,19 @@ Put the handset down, then lift it. The phone says “This is the Secrets Hotlin
 
 At server startup, all 729 three-digit keys made from 1–9 are shuffled, excluding keys whose message files already exist. Each key is issued at most once during that server run. Restarting the server reshuffles the available keys. Copy `server/data/` to another laptop if you want to keep saved messages.
 
-The microphone produces 16 kHz, 16-bit mono PCM: 32 KB per second. Audio is sent in small TCP chunks, so the ESP32 never stores a complete ten-second recording. The laptop saves each message as a WAV file. The client reports disconnects, and the server reconnects when the Wi-Fi link returns.
+The microphone produces 16 kHz, 16-bit mono PCM: 32 KB per second. A ten-second caller message is about 320 KB. Audio is sent in small TCP chunks, so the ESP32 never stores a complete caller recording. The laptop saves each message as a WAV file. The 16 reusable speech clips are compressed to about 165 KB in firmware flash; their playback needs no audio transfer from the laptop, though the laptop still chooses which clip to play. The current firmware occupies about 1.17 MB of its 1.31 MB application partition, leaving insufficient room for a collection of caller messages. The client reports disconnects, and the server reconnects when the Wi-Fi link returns.
 
 ## Change the voice or menu
 
-The server plays WAV clips from `server/assets/voice/` and never synthesizes speech during a call. To regenerate those clips, install the optional Piper dependency and download the Cori model:
+The firmware plays compressed speech clips built from WAV files in `server/assets/voice/`; the laptop never synthesizes speech during a call. To regenerate those clips, install the optional Piper dependency and download the Cori model:
 
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r scripts/requirements.txt
 .venv/bin/python -m piper.download_voices --data-dir voices en_GB-cori-medium
 .venv/bin/python scripts/generate_voice_clips.py
+python3 scripts/build_voice_header.py
+pio run -d client -t upload
 ```
 
 To change the embedded opening menu, edit `scripts/generate_menu_prompt.py`, then run:

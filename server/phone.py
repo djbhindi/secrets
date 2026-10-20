@@ -16,14 +16,12 @@ import wave
 RATE = 16000
 RECORD_SECONDS = 10
 MENU_REPEAT_SECONDS = 15
-VOICE_GAIN = 0.08
 PLAY_CHUNK_BYTES = 256 * 2
 PHONE_PORT = 45679
 DIGITS = "123456789"
 DIALED = re.compile(r"^DIALED ([1-9]) \(\d+ edges; turn (\d+)\)$")
 TRIGGER = re.compile(r"^TRIGGER \(20 edges; turn (\d+)\)$")
 SERVER_DIR = Path(__file__).resolve().parent
-VOICE_DIR = SERVER_DIR / "assets" / "voice"
 VOICE_CLIPS = ("record_after_beep", "store_full", "here_message",
                "your_code", "repeat", "you_dialed", "no_message",
                *(f"digit_{digit}" for digit in DIGITS))
@@ -135,7 +133,6 @@ class Phone:
                                if not (self.message_dir / ("".join(parts) + ".wav")).exists()]
         secrets.SystemRandom().shuffle(self.available_keys)
         self.pending = deque()
-        self.clips = {}
         self.offhook = False
         self.entered = ""
         self.last_turn_id = 0
@@ -173,16 +170,13 @@ class Phone:
                 raise RuntimeError(line)
         raise TimeoutError(f"ESP32 did not respond with {expected}")
 
-    def load_clips(self):
-        for name in VOICE_CLIPS:
-            raw = load_wav(VOICE_DIR / f"{name}.wav")
-            samples = pcm_samples(raw)
-            self.clips[name] = pcm_bytes(array("h", (round(s * VOICE_GAIN) for s in samples)))
-
     def speak_clips(self, *names):
-        if not self.clips:
-            self.load_clips()
-        self.play(b"".join(self.clips[name] for name in names))
+        if not 0 < len(names) <= 16:
+            raise ValueError("Expected 1 to 16 speech clips")
+        identifiers = bytes(VOICE_CLIPS.index(name) for name in names)
+        self.command("C")
+        self.port.write(bytes((len(identifiers),)) + identifiers)
+        self.wait_for("CLIPS PLAYED", seconds=30)
 
     def play(self, raw):
         count = len(raw) // 2
@@ -334,8 +328,6 @@ class Phone:
         self.port.flush()
         self.wait_for("HOST MODE", seconds=8)
         self.pending.clear()
-        if not self.clips:
-            self.load_clips()
         print("Phone ready. Put the handset down, then lift it to begin.", flush=True)
         while True:
             line = self.pending.popleft() if self.pending else self.line()
