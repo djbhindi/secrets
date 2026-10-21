@@ -39,8 +39,8 @@ class PhoneTests(unittest.TestCase):
             try:
                 self.assertEqual(right.recv(7), b"RPH1:P\n")
                 count = struct.unpack("<I", right.recv(4))[0]
-                self.assertEqual(count, 513)
-                for frames in (256, 256, 1):
+                self.assertEqual(count, 2049)
+                for frames in (1024, 1024, 1):
                     right.sendall(b"NEXT\n")
                     chunk = bytearray()
                     while len(chunk) < frames * 2:
@@ -56,7 +56,7 @@ class PhoneTests(unittest.TestCase):
             left.settimeout(1)
             with tempfile.TemporaryDirectory() as directory:
                 phone = Phone(SocketPort(left), Path(directory))
-                raw = bytes((index % 256 for index in range(513 * 2)))
+                raw = bytes((index % 256 for index in range(2049 * 2)))
                 phone.play(raw)
                 self.assertEqual(b"".join(received), raw)
         finally:

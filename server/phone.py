@@ -16,7 +16,7 @@ import wave
 RATE = 16000
 RECORD_SECONDS = 10
 MENU_REPEAT_SECONDS = 15
-PLAY_CHUNK_BYTES = 256 * 2
+PLAY_CHUNK_BYTES = 1024 * 2
 PHONE_PORT = 45679
 DIGITS = "123456789"
 DIALED = re.compile(r"^DIALED ([1-9]) \(\d+ edges; turn (\d+)\)$")
@@ -350,8 +350,8 @@ class Phone:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="192.168.4.1",
-                        help="ESP32 Wi-Fi address (default: ESP32 access point)")
+    parser.add_argument("--host", default="secrets-phone.local",
+                        help="ESP32 Wi-Fi name or IP address")
     parser.add_argument("--port", type=int, default=PHONE_PORT,
                         help="ESP32 TCP port")
     parser.add_argument("--messages", type=Path,

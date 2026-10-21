@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <driver/i2s.h>
 #include <driver/adc.h>
 #include <driver/rtc_io.h>
@@ -40,7 +41,7 @@ constexpr int SAMPLE_RATE = 32000;
 constexpr int RECORD_RATE = SAMPLE_RATE / 2;
 constexpr uint32_t HOST_RECORD_SAMPLES = RECORD_RATE * 10;
 constexpr size_t FRAMES_PER_READ = 256;
-constexpr size_t HOST_PLAY_FRAMES = 256;
+constexpr size_t HOST_PLAY_FRAMES = 1024;
 constexpr float PROMPT_GAIN = 0.08f;
 constexpr float VOICE_GAIN = 0.08f;
 constexpr uint16_t PHONE_PORT = 45679;
@@ -224,11 +225,18 @@ void recordHostAudio() {
 
 bool readNetworkBytes(uint8_t *destination, size_t count) {
   size_t received = 0;
+  unsigned long last_progress = millis();
   while (received < count) {
-    const size_t chunk = phone_client.readBytes(destination + received,
-                                                count - received);
-    if (chunk == 0) return false;
-    received += chunk;
+    const size_t request = min(static_cast<size_t>(1024), count - received);
+    const int chunk = phone_client.read(destination + received,
+                                        request);
+    if (chunk > 0) {
+      received += chunk;
+      last_progress = millis();
+    } else {
+      if (!phone_client.connected() || millis() - last_progress > 3000) return false;
+      delay(1);
+    }
   }
   return true;
 }
@@ -319,41 +327,53 @@ void playHostAudio() {
     return;
   }
   uint32_t played = 0;
+  phone_client.println("NEXT");
   while (played < sample_count) {
     pollDial();
     if (handsetDown()) {
       i2s_zero_dma_buffer(SPEAKER_PORT);
-      phone_client.println("ABORTED");
+      phone_client.stop(); // Discard any prefetched audio on hangup.
       return;
     }
     const size_t frames = min(static_cast<uint32_t>(HOST_PLAY_FRAMES),
                               sample_count - played);
-    phone_client.println("NEXT"); // Let the computer send only one small chunk.
     if (!readNetworkBytes(reinterpret_cast<uint8_t *>(host_play_chunk),
                          frames * sizeof(int16_t))) {
       phone_client.println("PLAY ERROR");
       return;
     }
+    // Ask for the next block while this one plays through the I2S DMA buffer.
+    if (played + frames < sample_count) phone_client.println("NEXT");
     pollDial();
     if (handsetDown()) {
       i2s_zero_dma_buffer(SPEAKER_PORT);
-      phone_client.println("ABORTED");
+      phone_client.stop();
       return;
     }
-    for (size_t frame = 0; frame < frames; ++frame) {
-      stereo_chunk[frame * 2] = host_play_chunk[frame];
-      stereo_chunk[frame * 2 + 1] = host_play_chunk[frame];
-    }
-    size_t written = 0;
-    if (i2s_write(SPEAKER_PORT, stereo_chunk, frames * 2 * sizeof(int16_t),
-                  &written, portMAX_DELAY) != ESP_OK ||
-        written != frames * 2 * sizeof(int16_t)) {
-      phone_client.println("PLAY ERROR");
-      return;
+    for (size_t offset = 0; offset < frames; offset += FRAMES_PER_READ) {
+      pollDial();
+      if (handsetDown()) {
+        i2s_zero_dma_buffer(SPEAKER_PORT);
+        phone_client.stop();
+        return;
+      }
+      const size_t block = min(FRAMES_PER_READ, frames - offset);
+      for (size_t frame = 0; frame < block; ++frame) {
+        const int16_t value = host_play_chunk[offset + frame];
+        stereo_chunk[frame * 2] = value;
+        stereo_chunk[frame * 2 + 1] = value;
+      }
+      size_t written = 0;
+      if (i2s_write(SPEAKER_PORT, stereo_chunk, block * 2 * sizeof(int16_t),
+                    &written, portMAX_DELAY) != ESP_OK ||
+          written != block * 2 * sizeof(int16_t)) {
+        phone_client.println("PLAY ERROR");
+        return;
+      }
     }
     played += frames;
   }
-  delay(50);
+  delay(80);
   i2s_zero_dma_buffer(SPEAKER_PORT);
   phone_client.println(handsetDown() ? "ABORTED" : "PLAYED");
 }
@@ -531,16 +551,19 @@ void setup() {
   i2s_zero_dma_buffer(SPEAKER_PORT);
   Serial.printf("Audio memory: prompt=flash, messages=streamed; free heap: %u\n",
                 ESP.getFreeHeap());
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
-                    IPAddress(255, 255, 255, 0));
-  if (!WiFi.softAP(PHONE_AP_SSID, PHONE_AP_PASSWORD)) {
-    Serial.println("Phone Wi-Fi access point failed");
-    while (true) delay(1000);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(PHONE_WIFI_SSID, PHONE_WIFI_PASSWORD);
+  Serial.printf("Joining Wi-Fi: %s\n", PHONE_WIFI_SSID);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+  if (!MDNS.begin("secrets-phone")) {
+    Serial.println("mDNS name unavailable; use the printed IP address");
   }
   phone_server.begin();
   Serial.printf("Phone Wi-Fi: %s at %s:%u; free heap: %u\n",
-                PHONE_AP_SSID, WiFi.softAPIP().toString().c_str(),
+                PHONE_WIFI_SSID, WiFi.localIP().toString().c_str(),
                 PHONE_PORT, ESP.getFreeHeap());
 }
 
@@ -580,6 +603,11 @@ bool pollNetworkCommand() {
 }
 
 void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    phone_client.stop();
+    delay(100);
+    return;
+  }
   if (!phone_client.connected()) {
     phone_client.stop();
     pollCradle(false);

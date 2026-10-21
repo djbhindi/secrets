@@ -1,6 +1,6 @@
 # Wireless rotary phone message system
 
-The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone, and drives a MAX98357A amplifier. It creates a local Wi-Fi network that the laptop joins. The opening menu and all reusable Cori speech clips are stored in ESP32 flash and play locally. The laptop stores callers' messages and streams those recordings when requested. USB is needed to flash the ESP32 and can then be replaced with a USB wall adapter or power bank for power; commands and caller audio travel over Wi-Fi TCP.
+The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone, and drives a MAX98357A amplifier. It joins the same 2.4 GHz Wi-Fi network as the laptop. The opening menu and all reusable Cori speech clips are stored in ESP32 flash and play locally. The laptop stores callers' messages and streams those recordings when requested. USB is needed to flash the ESP32 and can then be replaced with a USB wall adapter or power bank for power; commands and caller audio travel over Wi-Fi TCP.
 
 ## Layout
 
@@ -21,25 +21,25 @@ The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone,
 | Phone cradle | F/A terminals | GND, GPIO4 or GPIO32 |
 | Rotary dial | F, RR | GND, GPIO5 |
 
-Set `PHONE_CRADLE_PIN` in `client/include/network_config.h` to match the cradle wire. GPIO32 uses ADC1 and is the default. The original GPIO4 wire can stay in place with `PHONE_CRADLE_PIN 4`; that mode senses a digital high/low level because Wi-Fi prevents ADC2 readings on the original ESP32. Verify both handset positions after flashing, since the GPIO4 digital mode depends on the voltage levels of this particular phone. The other cradle wire stays on GND. Connect the speaker to both amplifier output terminals, never to ESP32 GPIO or GND. All devices share a ground. GPIO5 is a startup strapping pin, so verify the board still boots with the dial connected.
+Set `PHONE_CRADLE_PIN` in `client/include/network_config.h` to match the cradle wire. The example uses GPIO4, matching this phone's original wiring. That mode senses a digital high/low level because Wi-Fi prevents ADC2 readings on the original ESP32. GPIO32 is available for ADC1 sensing if the wire is moved. Verify both handset positions after flashing. The other cradle wire stays on GND. Connect the speaker to both amplifier output terminals, never to ESP32 GPIO or GND. All devices share a ground. GPIO5 is a startup strapping pin, so verify the board still boots with the dial connected.
 
 ## Configure and run
 
-Copy `client/include/network_config.h.example` to `client/include/network_config.h` and set a private Wi-Fi password of at least eight characters. The real config file is ignored by Git.
+Copy `client/include/network_config.h.example` to `client/include/network_config.h` and enter the Wi-Fi network name and password used by the laptop. The real config file is ignored by Git.
 
 ```sh
 cp client/include/network_config.h.example client/include/network_config.h
-# Edit PHONE_AP_PASSWORD in client/include/network_config.h
+# Edit PHONE_WIFI_SSID and PHONE_WIFI_PASSWORD in client/include/network_config.h
 pio run -d client -t upload
 ```
 
-After flashing, join the ESP32's `SecretsPhone` Wi-Fi network from the laptop using that password. Start the laptop program:
+Leave the laptop on the same Wi-Fi network and start its program:
 
 ```sh
 python3 server/phone.py
 ```
 
-The default ESP32 address is `192.168.4.1`, TCP port `45679`. The laptop needs no Python packages beyond the standard library to run the server. The ESP32 access point does not provide internet access, so the laptop may use this Wi-Fi connection in place of its usual one. Keep the ESP32 powered from a wall adapter or power bank when unplugging it from the laptop.
+The laptop finds the ESP32 at `secrets-phone.local`, TCP port `45679`. If local name resolution is unavailable, read the ESP32's IP address from its USB startup log and pass `--host ADDRESS` to the laptop program. The laptop needs no Python packages beyond the standard library to run the server. Keep the ESP32 powered from a wall adapter or power bank when unplugging it from the laptop.
 
 Put the handset down, then lift it. The phone says “This is the Secrets Hotline” and gives the dial instructions. After 15 seconds of inactivity it repeats only the instructions. Starting to dial skips the rest of the menu. Dial **0** to record a ten-second message, or dial a three-digit key using **1–9** to hear one. A beep marks the beginning and end of recording and follows playback. Hanging up aborts the current action. A missing key can be retried without hanging up.
 
