@@ -14,6 +14,9 @@
 #ifndef PHONE_CRADLE_PIN
 #define PHONE_CRADLE_PIN 32
 #endif
+#ifndef PHONE_SERVER_HOST
+#error "Set PHONE_SERVER_HOST in network_config.h"
+#endif
 #if PHONE_CRADLE_PIN != 4 && PHONE_CRADLE_PIN != 32
 #error "PHONE_CRADLE_PIN must be GPIO4 or GPIO32"
 #endif
@@ -46,8 +49,11 @@ constexpr float PROMPT_GAIN = 0.08f;
 constexpr float VOICE_GAIN = 0.08f;
 constexpr uint16_t PHONE_PORT = 45679;
 
-WiFiServer phone_server(PHONE_PORT);
 WiFiClient phone_client;
+constexpr unsigned long SERVER_RETRY_MS = 3000;
+constexpr unsigned long SERVER_IDLE_TIMEOUT_MS = 20000;
+unsigned long last_server_attempt_at = 0;
+unsigned long last_server_contact_at = 0;
 
 int32_t samples[FRAMES_PER_READ * 2]; // left, right, repeated
 int16_t recording_chunk[FRAMES_PER_READ / 2];
@@ -561,16 +567,16 @@ void setup() {
   if (!MDNS.begin("secrets-phone")) {
     Serial.println("mDNS name unavailable; use the printed IP address");
   }
-  phone_server.begin();
-  Serial.printf("Phone Wi-Fi: %s at %s:%u; free heap: %u\n",
+  Serial.printf("Phone Wi-Fi: %s at %s; laptop: %s:%u; free heap: %u\n",
                 PHONE_WIFI_SSID, WiFi.localIP().toString().c_str(),
-                PHONE_PORT, ESP.getFreeHeap());
+                PHONE_SERVER_HOST, PHONE_PORT, ESP.getFreeHeap());
 }
 
 bool pollNetworkCommand() {
   bool consumed = false;
   while (phone_client.available()) {
     consumed = true;
+    last_server_contact_at = millis();
     const int incoming = phone_client.read();
     if (incoming != '\n') {
       if (incoming >= 32 && incoming <= 126 &&
@@ -608,23 +614,40 @@ void loop() {
     delay(100);
     return;
   }
+  if (phone_client.connected() &&
+      millis() - last_server_contact_at > SERVER_IDLE_TIMEOUT_MS) {
+    Serial.println("Laptop timed out; reconnecting");
+    phone_client.stop();
+  }
   if (!phone_client.connected()) {
     phone_client.stop();
     pollCradle(false);
-    WiFiClient next_client = phone_server.available();
-    if (next_client) {
-      phone_client = next_client;
-      phone_client.setNoDelay(true);
-      phone_client.setTimeout(3000);
-      command_length = 0;
-      cradle_event_pending = false;
-      noInterrupts();
-      dial_reported_edges = dial_edges;
-      interrupts();
-      dial_pending_edges = 0;
-      dial_turn_at_lift = dial_turn_id;
-      Serial.printf("Laptop connected from %s\n",
-                    phone_client.remoteIP().toString().c_str());
+    const unsigned long now = millis();
+    if (last_server_attempt_at == 0 ||
+        now - last_server_attempt_at >= SERVER_RETRY_MS) {
+      last_server_attempt_at = now;
+      IPAddress server_address;
+      if (!server_address.fromString(PHONE_SERVER_HOST)) {
+        server_address = MDNS.queryHost(PHONE_SERVER_HOST, 2000);
+      }
+      if (server_address == IPAddress()) {
+        Serial.printf("Laptop %s not found; retrying\n", PHONE_SERVER_HOST);
+      } else if (phone_client.connect(server_address, PHONE_PORT, 2000)) {
+        phone_client.setNoDelay(true);
+        phone_client.setTimeout(3000);
+        last_server_contact_at = millis();
+        command_length = 0;
+        noInterrupts();
+        dial_reported_edges = dial_edges;
+        interrupts();
+        dial_pending_edges = 0;
+        dial_turn_at_lift = dial_turn_id;
+        Serial.printf("Connected to laptop at %s:%u\n",
+                      server_address.toString().c_str(), PHONE_PORT);
+      } else {
+        Serial.printf("Laptop %s:%u unavailable; retrying\n",
+                      server_address.toString().c_str(), PHONE_PORT);
+      }
     }
     delay(10);
     return;

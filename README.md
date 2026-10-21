@@ -25,11 +25,11 @@ Set `PHONE_CRADLE_PIN` in `client/include/network_config.h` to match the cradle 
 
 ## Configure and run
 
-Copy `client/include/network_config.h.example` to `client/include/network_config.h` and enter the Wi-Fi network name and password used by the laptop. The real config file is ignored by Git.
+Copy `client/include/network_config.h.example` to `client/include/network_config.h` and enter the Wi-Fi network name and password used by the laptop. Set `PHONE_SERVER_HOST` to the laptop's local network name (without `.local`) or its IP address. On a Mac, `scutil --get LocalHostName` prints the name. The real config file is ignored by Git.
 
 ```sh
 cp client/include/network_config.h.example client/include/network_config.h
-# Edit PHONE_WIFI_SSID and PHONE_WIFI_PASSWORD in client/include/network_config.h
+# Edit PHONE_WIFI_SSID, PHONE_WIFI_PASSWORD, and PHONE_SERVER_HOST
 pio run -d client -t upload
 ```
 
@@ -39,13 +39,13 @@ Leave the laptop on the same Wi-Fi network and start its program:
 python3 server/phone.py
 ```
 
-The laptop finds the ESP32 at `secrets-phone.local`, TCP port `45679`. If local name resolution is unavailable, read the ESP32's IP address from its USB startup log and pass `--host ADDRESS` to the laptop program. The laptop needs no Python packages beyond the standard library to run the server. Keep the ESP32 powered from a wall adapter or power bank when unplugging it from the laptop.
+The laptop listens on TCP port `45679`. The ESP32 looks up the laptop and connects on boot, then reconnects if the link drops. A dead call session times out and closes while the laptop keeps listening for a new connection. If local name resolution is unavailable, set `PHONE_SERVER_HOST` to the laptop's current IP address and flash again. The laptop needs no Python packages beyond the standard library to run the server. Keep the ESP32 powered from a wall adapter or power bank when unplugging it from the laptop.
 
 Put the handset down, then lift it. The phone says “This is the Secrets Hotline” and gives the dial instructions. After 15 seconds of inactivity it repeats only the instructions. Starting to dial skips the rest of the menu. Dial **0** to record a ten-second message, or dial a three-digit key using **1–9** to hear one. A beep marks the beginning and end of recording and follows playback. Hanging up aborts the current action. A missing key can be retried without hanging up.
 
 At server startup, all 729 three-digit keys made from 1–9 are shuffled, excluding keys whose message files already exist. Each key is issued at most once during that server run. Restarting the server reshuffles the available keys. Copy `server/data/` to another laptop if you want to keep saved messages.
 
-The microphone produces 16 kHz, 16-bit mono PCM: 32 KB per second. A ten-second caller message is about 320 KB. Audio is sent in small TCP chunks, so the ESP32 never stores a complete caller recording. The laptop saves each message as a WAV file. The 16 reusable speech clips are compressed to about 165 KB in firmware flash; their playback needs no audio transfer from the laptop, though the laptop still chooses which clip to play. The current firmware occupies about 1.17 MB of its 1.31 MB application partition, leaving insufficient room for a collection of caller messages. The client reports disconnects, and the server reconnects when the Wi-Fi link returns.
+The microphone produces 16 kHz, 16-bit mono PCM: 32 KB per second. A ten-second caller message is about 320 KB. Audio is sent in small TCP chunks, so the ESP32 never stores a complete caller recording. The laptop saves each message as a WAV file. The 16 reusable speech clips are compressed to about 165 KB in firmware flash; their playback needs no audio transfer from the laptop, though the laptop still chooses which clip to play. The current firmware occupies about 1.17 MB of its 1.31 MB application partition, leaving insufficient room for a collection of caller messages. The client reconnects when the Wi-Fi link or laptop service returns.
 
 ## Change the voice or menu
 

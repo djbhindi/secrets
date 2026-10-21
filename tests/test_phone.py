@@ -31,6 +31,16 @@ class FakePort:
 
 
 class PhoneTests(unittest.TestCase):
+    def test_idle_phone_detects_stale_connection_after_reboot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            port = FakePort(b"HOST MODE\n")
+            phone = Phone(port, Path(directory))
+            with patch("server.phone.HEARTBEAT_SECONDS", 0), \
+                 patch("server.phone.HEARTBEAT_TIMEOUT_SECONDS", 0.01):
+                with self.assertRaises(TimeoutError):
+                    phone.run()
+            self.assertEqual(port.sent.count(b"RPH1:H\n"), 2)
+
     def test_tcp_playback_streams_bounded_chunks(self):
         left, right = socket.socketpair()
         received = []

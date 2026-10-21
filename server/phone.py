@@ -16,6 +16,8 @@ import wave
 RATE = 16000
 RECORD_SECONDS = 10
 MENU_REPEAT_SECONDS = 15
+HEARTBEAT_SECONDS = 5
+HEARTBEAT_TIMEOUT_SECONDS = 3
 PLAY_CHUNK_BYTES = 1024 * 2
 PHONE_PORT = 45679
 DIGITS = "123456789"
@@ -329,6 +331,7 @@ class Phone:
         self.wait_for("HOST MODE", seconds=8)
         self.pending.clear()
         print("Phone ready. Put the handset down, then lift it to begin.", flush=True)
+        last_contact = time.monotonic()
         while True:
             line = self.pending.popleft() if self.pending else self.line()
             if line:
@@ -339,6 +342,7 @@ class Phone:
                     self.offhook = False
                     self.entered = ""
                     self.menu_repeat_at = None
+                last_contact = time.monotonic()
             try:
                 self.repeat_menu_if_due()
             except Hangup:
@@ -346,29 +350,39 @@ class Phone:
                 self.offhook = False
                 self.entered = ""
                 self.menu_repeat_at = None
+            if not line and time.monotonic() - last_contact >= HEARTBEAT_SECONDS:
+                self.command("H")
+                self.wait_for("HOST MODE", seconds=HEARTBEAT_TIMEOUT_SECONDS)
+                last_contact = time.monotonic()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="secrets-phone.local",
-                        help="ESP32 Wi-Fi name or IP address")
+    parser.add_argument("--bind", default="0.0.0.0",
+                        help="Laptop address to listen on")
     parser.add_argument("--port", type=int, default=PHONE_PORT,
-                        help="ESP32 TCP port")
+                        help="Laptop TCP port")
     parser.add_argument("--messages", type=Path,
                         default=SERVER_DIR / "data" / "messages")
     args = parser.parse_args()
     phone = Phone(None, args.messages)
-    while True:
-        try:
-            with socket.create_connection((args.host, args.port), timeout=3) as connection:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((args.bind, args.port))
+        listener.listen(1)
+        print(f"Waiting for ESP32 on {args.bind}:{args.port}", flush=True)
+        while True:
+            connection, address = listener.accept()
+            with connection:
                 connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 connection.settimeout(2)
                 phone.port = SocketPort(connection)
-                print(f"Connected to phone at {args.host}:{args.port}", flush=True)
-                phone.run()
-        except (ConnectionError, TimeoutError, OSError) as error:
-            print(f"Phone connection lost: {error}. Retrying...", flush=True)
-            time.sleep(2)
+                print(f"Phone connected from {address[0]}:{address[1]}", flush=True)
+                try:
+                    phone.run()
+                except (ConnectionError, TimeoutError, OSError) as error:
+                    print(f"Phone session ended: {error}. Waiting for ESP32...",
+                          flush=True)
 
 
 if __name__ == "__main__":

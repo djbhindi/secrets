@@ -4,5 +4,6 @@
 // 2.4 GHz Wi-Fi network shared by the ESP32 and the laptop.
 #define PHONE_WIFI_SSID "your-wifi-name"
 #define PHONE_WIFI_PASSWORD "your-wifi-password"
+#define PHONE_SERVER_HOST "your-laptop-name"
 // Original phone wiring uses GPIO4 with a digital read; use 32 for ADC1 wiring.
 #define PHONE_CRADLE_PIN 4
