@@ -20,6 +20,7 @@ HEARTBEAT_SECONDS = 5
 HEARTBEAT_TIMEOUT_SECONDS = 3
 PLAY_CHUNK_BYTES = 1024 * 2
 PHONE_PORT = 45679
+ESP32_AP_HOST = "192.168.4.1"
 DIGITS = "123456789"
 DIALED = re.compile(r"^DIALED ([1-9]) \(\d+ edges; turn (\d+)\)$")
 TRIGGER = re.compile(r"^TRIGGER \(20 edges; turn (\d+)\)$")
@@ -140,6 +141,7 @@ class Phone:
         self.last_turn_id = 0
         self.last_logged_line = ""
         self.menu_repeat_at = None
+        self.serial_pacing = False
 
     def command(self, letter):
         self.port.write(b"RPH1:" + letter.encode("ascii") + b"\n")
@@ -180,15 +182,20 @@ class Phone:
         self.port.write(bytes((len(identifiers),)) + identifiers)
         self.wait_for("CLIPS PLAYED", seconds=30)
 
-    def play(self, raw):
+    def play(self, raw, intro_clip=None):
         count = len(raw) // 2
         if not 0 < count <= RATE * 30:
             raise ValueError("Playback must be between 0 and 30 seconds")
+        intro_id = 255 if intro_clip is None else VOICE_CLIPS.index(intro_clip)
         self.command("P")
-        self.port.write(struct.pack("<I", count))
-        for offset in range(0, len(raw), PLAY_CHUNK_BYTES):
-            self.wait_for("NEXT", seconds=5)
-            self.port.write(raw[offset:offset + PLAY_CHUNK_BYTES])
+        self.port.write(struct.pack("<IB", count, intro_id))
+        if self.serial_pacing:
+            for offset in range(0, len(raw), 256):
+                self.wait_for("NEXT", seconds=10)
+                self.port.write(raw[offset:offset + 256])
+        else:
+            for offset in range(0, len(raw), PLAY_CHUNK_BYTES):
+                self.port.write(raw[offset:offset + PLAY_CHUNK_BYTES])
         self.wait_for("PLAYED", seconds=max(20, count / RATE + 10))
 
     def beep(self):
@@ -215,7 +222,8 @@ class Phone:
     def record(self):
         self.command("R")
         self.port.flush()
-        deadline = time.monotonic() + 8
+        print("Recording for ten seconds on the ESP32...", flush=True)
+        deadline = time.monotonic() + RECORD_SECONDS + 15
         marker = bytearray()
         while bytes(marker) != b"REC1":
             if time.monotonic() > deadline:
@@ -227,7 +235,7 @@ class Phone:
         rate = struct.unpack("<I", read_exact(self.port, 4))[0]
         if rate != RATE:
             raise ValueError(f"Unexpected recording rate: {rate} Hz")
-        print("Recording for ten seconds...", flush=True)
+        print("Transferring recorded audio...", flush=True)
         raw = bytearray()
         while True:
             packet = read_exact(self.port, 258)
@@ -236,8 +244,14 @@ class Phone:
                 if len(raw) != RATE * RECORD_SECONDS * 2:
                     raise Hangup
                 return bytes(raw)
-            if count == 65535:
-                raise RuntimeError("ESP32 microphone read failed")
+            capture_errors = {65535: "flash open", 65534: "I2S read",
+                              65533: "empty I2S buffer", 65532: "flash write",
+                              65531: "flash reopen", 65530: "flash read"}
+            if count in capture_errors:
+                captured = struct.unpack_from("<I", packet, 2)[0]
+                raise RuntimeError(
+                    f"ESP32 capture failed: {capture_errors[count]} "
+                    f"after {captured} samples")
             if count > 128 or len(raw) + count * 2 > RATE * RECORD_SECONDS * 2:
                 raise ValueError(f"Invalid recording chunk: {count} samples after {len(raw) // 2} samples")
             raw.extend(packet[2:2 + count * 2])
@@ -258,7 +272,6 @@ class Phone:
         save_wav(temporary, raw)
         temporary.replace(destination)
         print(f"Saved message {key}: {destination.resolve()}", flush=True)
-        self.beep()
         digits = tuple(f"digit_{digit}" for digit in key)
         self.speak_clips("your_code", *digits, "repeat", *digits)
 
@@ -269,10 +282,9 @@ class Phone:
                              "no_message")
             return
         print(f"Playing message {key}: {path.resolve()}", flush=True)
-        self.speak_clips("here_message")
         raw, gain = listening_copy(load_wav(path))
         print(f"Playback gain: {gain:.1f} times", flush=True)
-        self.play(raw)
+        self.play(raw, intro_clip="here_message")
         self.beep()
 
     def handle(self, line):
@@ -358,6 +370,10 @@ class Phone:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--connection", choices=("usb", "shared-wifi", "esp32-ap"),
+                        default="shared-wifi", help="ESP32 transport")
+    parser.add_argument("--serial-port", default="/dev/cu.usbserial-0001",
+                        help="USB serial device in USB mode")
     parser.add_argument("--bind", default="0.0.0.0",
                         help="Laptop address to listen on")
     parser.add_argument("--port", type=int, default=PHONE_PORT,
@@ -366,6 +382,34 @@ def main():
                         default=SERVER_DIR / "data" / "messages")
     args = parser.parse_args()
     phone = Phone(None, args.messages)
+    if args.connection == "usb":
+        try:
+            import serial
+        except ImportError as error:
+            raise SystemExit("USB mode needs pyserial: python3 -m pip install pyserial") from error
+        print(f"Opening ESP32 on {args.serial_port}", flush=True)
+        phone.serial_pacing = True
+        while True:
+            try:
+                with serial.Serial(args.serial_port, 460800, timeout=2,
+                                   write_timeout=3) as port:
+                    run_phone(phone, port)
+            except (serial.SerialException, OSError) as error:
+                print(f"USB unavailable: {error}. Retrying...", flush=True)
+            time.sleep(2)
+        return
+    if args.connection == "esp32-ap":
+        print(f"Connecting to ESP32 at {ESP32_AP_HOST}:{args.port}", flush=True)
+        while True:
+            try:
+                connection = socket.create_connection((ESP32_AP_HOST, args.port),
+                                                      timeout=3)
+            except OSError:
+                time.sleep(3)
+                continue
+            run_session(phone, connection)
+            time.sleep(1)
+        return
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((args.bind, args.port))
@@ -373,16 +417,24 @@ def main():
         print(f"Waiting for ESP32 on {args.bind}:{args.port}", flush=True)
         while True:
             connection, address = listener.accept()
-            with connection:
-                connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                connection.settimeout(2)
-                phone.port = SocketPort(connection)
-                print(f"Phone connected from {address[0]}:{address[1]}", flush=True)
-                try:
-                    phone.run()
-                except (ConnectionError, TimeoutError, OSError) as error:
-                    print(f"Phone session ended: {error}. Waiting for ESP32...",
-                          flush=True)
+            print(f"Phone connected from {address[0]}:{address[1]}", flush=True)
+            run_session(phone, connection)
+
+
+def run_session(phone, connection):
+    with connection:
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        connection.settimeout(2)
+        run_phone(phone, SocketPort(connection))
+
+
+def run_phone(phone, port):
+    phone.port = port
+    try:
+        phone.run()
+    except (ConnectionError, TimeoutError, OSError,
+            RuntimeError, ValueError) as error:
+        print(f"Phone session ended: {error}. Reconnecting...", flush=True)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <ESPmDNS.h>
+#include <SPIFFS.h>
 #include <driver/i2s.h>
 #include <driver/adc.h>
 #include <driver/rtc_io.h>
@@ -9,13 +9,10 @@
 #include <soc/soc.h>
 #include "prompt_pcm.h"
 #include "voice_adpcm.h"
-#include "network_config.h"
+#include "phone_transport.h"
 
 #ifndef PHONE_CRADLE_PIN
 #define PHONE_CRADLE_PIN 32
-#endif
-#ifndef PHONE_SERVER_HOST
-#error "Set PHONE_SERVER_HOST in network_config.h"
 #endif
 #if PHONE_CRADLE_PIN != 4 && PHONE_CRADLE_PIN != 32
 #error "PHONE_CRADLE_PIN must be GPIO4 or GPIO32"
@@ -47,9 +44,9 @@ constexpr size_t FRAMES_PER_READ = 256;
 constexpr size_t HOST_PLAY_FRAMES = 1024;
 constexpr float PROMPT_GAIN = 0.08f;
 constexpr float VOICE_GAIN = 0.08f;
-constexpr uint16_t PHONE_PORT = 45679;
+constexpr char AUDIO_FILE[] = "/audio.pcm";
 
-WiFiClient phone_client;
+PhoneTransport phone_client;
 constexpr unsigned long SERVER_RETRY_MS = 3000;
 constexpr unsigned long SERVER_IDLE_TIMEOUT_MS = 20000;
 unsigned long last_server_attempt_at = 0;
@@ -57,6 +54,7 @@ unsigned long last_server_contact_at = 0;
 
 int32_t samples[FRAMES_PER_READ * 2]; // left, right, repeated
 int16_t recording_chunk[FRAMES_PER_READ / 2];
+uint8_t recording_file_chunk[4096];
 int16_t host_play_chunk[FRAMES_PER_READ];
 int16_t stereo_chunk[FRAMES_PER_READ * 2];
 constexpr uint32_t prompt_samples =
@@ -189,27 +187,51 @@ bool writeNetworkBytes(const uint8_t *source, size_t count) {
   return sent == count;
 }
 
-void recordHostAudio() {
-  discardMicStartup();
-  const uint32_t rate = RECORD_RATE;
-  if (!writeNetworkBytes(reinterpret_cast<const uint8_t *>("REC1"), 4) ||
-      !writeNetworkBytes(reinterpret_cast<const uint8_t *>(&rate), sizeof(rate))) return;
+bool playBeep();
+bool playVoiceClip(uint8_t clip_id);
 
+bool writeAudioFile(File &file, const uint8_t *data, size_t count) {
+  size_t written = 0;
+  int stalls = 0;
+  while (written < count) {
+    const size_t bytes = file.write(data + written, count - written);
+    if (bytes == 0) {
+      if (++stalls >= 3) return false;
+      delay(1);
+      continue;
+    }
+    written += bytes;
+    stalls = 0;
+  }
+  return true;
+}
+
+void recordHostAudio() {
   uint16_t packet[FRAMES_PER_READ / 2 + 1] = {};
+  if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+  File recording = SPIFFS.open(AUDIO_FILE, FILE_WRITE);
+  if (!recording) {
+    const uint32_t rate = RECORD_RATE;
+    packet[0] = UINT16_MAX;
+    writeNetworkBytes(reinterpret_cast<const uint8_t *>("REC1"), 4);
+    writeNetworkBytes(reinterpret_cast<const uint8_t *>(&rate), sizeof(rate));
+    writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
+    return;
+  }
+  discardMicStartup();
   uint32_t captured = 0;
+  uint16_t status = 0;
+  size_t buffered = 0;
+  const unsigned long capture_started_at = millis();
   while (captured < HOST_RECORD_SAMPLES) {
     if (handsetDown(false)) {
-      packet[0] = 0;
-      writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
-      pollCradle();
-      return;
+      break;
     }
     size_t bytes_read = 0;
     if (i2s_read(I2S_PORT, samples, sizeof(samples), &bytes_read,
                  portMAX_DELAY) != ESP_OK) {
-      packet[0] = UINT16_MAX;
-      writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
-      return;
+      status = 65534; // I2S read.
+      break;
     }
     const size_t frames = bytes_read / (2 * sizeof(int32_t));
     uint16_t count = 0;
@@ -219,11 +241,81 @@ void recordHostAudio() {
       const int32_t b = samples[(frame + 1) * 2] >> 16;
       recording_chunk[count++] = static_cast<int16_t>((a + b) / 2);
     }
-    packet[0] = count;
-    memcpy(&packet[1], recording_chunk, count * sizeof(int16_t));
-    if (!writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet),
-                           sizeof(packet))) return;
+    if (count == 0) {
+      status = 65533; // Empty I2S buffer.
+      break;
+    }
+    const size_t bytes = count * sizeof(int16_t);
+    if (buffered + bytes > sizeof(recording_file_chunk)) {
+      if (!writeAudioFile(recording, recording_file_chunk, buffered)) {
+        status = 65532; // Flash write.
+        break;
+      }
+      buffered = 0;
+    }
+    memcpy(recording_file_chunk + buffered, recording_chunk, bytes);
+    buffered += bytes;
+    if (buffered == sizeof(recording_file_chunk) ||
+        captured + count == HOST_RECORD_SAMPLES) {
+      if (!writeAudioFile(recording, recording_file_chunk, buffered)) {
+        status = 65532; // Flash write.
+        break;
+      }
+      buffered = 0;
+    }
     captured += count;
+  }
+  recording.close();
+  PHONE_LOG_PRINTF("Captured %lu samples in %lu ms\n",
+                static_cast<unsigned long>(captured),
+                static_cast<unsigned long>(millis() - capture_started_at));
+  if (captured != HOST_RECORD_SAMPLES && status == 0) {
+    if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+    pollCradle();
+  }
+  if (captured == HOST_RECORD_SAMPLES && !playBeep()) {
+    if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+    status = 0;
+    captured = 0;
+  }
+  const uint32_t rate = RECORD_RATE;
+  if (!writeNetworkBytes(reinterpret_cast<const uint8_t *>("REC1"), 4) ||
+      !writeNetworkBytes(reinterpret_cast<const uint8_t *>(&rate), sizeof(rate))) return;
+  if (captured == HOST_RECORD_SAMPLES && status == 0) {
+    recording = SPIFFS.open(AUDIO_FILE, FILE_READ);
+    if (!recording) status = 65531; // Flash reopen.
+    while (status == 0 && recording.available()) {
+      if (handsetDown()) {
+        recording.close();
+        if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+        phone_client.stop();
+        return;
+      }
+      const size_t bytes = recording.readBytes(
+          reinterpret_cast<char *>(&packet[1]), sizeof(packet) - 2);
+      if (bytes == 0 || bytes % 2 != 0) {
+        status = 65530; // Flash read.
+        break;
+      }
+      packet[0] = bytes / 2;
+      if (!writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet),
+                             sizeof(packet))) {
+        recording.close();
+        if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+        phone_client.stop();
+        return;
+      }
+    }
+    recording.close();
+  }
+  if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+  PHONE_LOG_PRINTF("Temporary audio cleared; SPIFFS used: %u bytes\n",
+                static_cast<unsigned>(SPIFFS.usedBytes()));
+  packet[0] = status;
+  if (status != 0) {
+    memcpy(&packet[1], &captured, sizeof(captured));
+    writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
+    return;
   }
   packet[0] = 0;
   writeNetworkBytes(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
@@ -246,6 +338,103 @@ bool readNetworkBytes(uint8_t *destination, size_t count) {
   }
   return true;
 }
+
+#if PHONE_CONNECTION_MODE == PHONE_CONNECTION_USB
+void recordUsbAudio() {
+  discardMicStartup();
+  const uint32_t rate = RECORD_RATE;
+  phone_client.write(reinterpret_cast<const uint8_t *>("REC1"), 4);
+  phone_client.write(reinterpret_cast<const uint8_t *>(&rate), sizeof(rate));
+  uint16_t packet[FRAMES_PER_READ / 2 + 1] = {};
+  uint32_t captured = 0;
+  while (captured < HOST_RECORD_SAMPLES) {
+    if (handsetDown(false)) {
+      packet[0] = 0;
+      phone_client.write(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
+      phone_client.flush();
+      pollCradle();
+      return;
+    }
+    size_t bytes_read = 0;
+    if (i2s_read(I2S_PORT, samples, sizeof(samples), &bytes_read,
+                 portMAX_DELAY) != ESP_OK) {
+      packet[0] = UINT16_MAX;
+      phone_client.write(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
+      phone_client.flush();
+      return;
+    }
+    const size_t frames = bytes_read / (2 * sizeof(int32_t));
+    uint16_t count = 0;
+    for (size_t frame = 0; frame + 1 < frames &&
+                           captured + count < HOST_RECORD_SAMPLES; frame += 2) {
+      const int32_t a = samples[frame * 2] >> 16;
+      const int32_t b = samples[(frame + 1) * 2] >> 16;
+      recording_chunk[count++] = static_cast<int16_t>((a + b) / 2);
+    }
+    if (count == 0) {
+      packet[0] = UINT16_MAX;
+      phone_client.write(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
+      phone_client.flush();
+      return;
+    }
+    packet[0] = count;
+    memcpy(&packet[1], recording_chunk, count * sizeof(int16_t));
+    phone_client.write(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
+    captured += count;
+  }
+  playBeep();
+  packet[0] = 0;
+  phone_client.write(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
+  phone_client.flush();
+}
+
+void playUsbAudio() {
+  uint32_t sample_count = 0;
+  uint8_t intro_clip = 255;
+  if (!readNetworkBytes(reinterpret_cast<uint8_t *>(&sample_count), 4) ||
+      !readNetworkBytes(&intro_clip, 1) ||
+      sample_count == 0 || sample_count > RECORD_RATE * 30 ||
+      (intro_clip != 255 && intro_clip >= VOICE_CLIP_COUNT)) {
+    phone_client.println("PLAY ERROR");
+    return;
+  }
+  if (intro_clip != 255 && !playVoiceClip(intro_clip)) {
+    phone_client.println(handsetDown() ? "ABORTED" : "SPEAKER ERROR");
+    return;
+  }
+  uint32_t played = 0;
+  while (played < sample_count) {
+    if (handsetDown()) {
+      i2s_zero_dma_buffer(SPEAKER_PORT);
+      phone_client.println("ABORTED");
+      return;
+    }
+    const size_t frames = min(static_cast<uint32_t>(FRAMES_PER_READ / 2),
+                              sample_count - played);
+    phone_client.println("NEXT");
+    if (!readNetworkBytes(reinterpret_cast<uint8_t *>(host_play_chunk),
+                          frames * sizeof(int16_t))) {
+      phone_client.println("PLAY ERROR");
+      return;
+    }
+    for (size_t frame = 0; frame < frames; ++frame) {
+      stereo_chunk[frame * 2] = host_play_chunk[frame];
+      stereo_chunk[frame * 2 + 1] = host_play_chunk[frame];
+    }
+    size_t written = 0;
+    if (i2s_write(SPEAKER_PORT, stereo_chunk, frames * 2 * sizeof(int16_t),
+                  &written, portMAX_DELAY) != ESP_OK ||
+        written != frames * 2 * sizeof(int16_t)) {
+      phone_client.println("PLAY ERROR");
+      return;
+    }
+    played += frames;
+  }
+  delay(50);
+  i2s_zero_dma_buffer(SPEAKER_PORT);
+  phone_client.println(handsetDown() ? "ABORTED" : "PLAYED");
+}
+#endif
 
 // IMA ADPCM state resets for each prerecorded clip.
 constexpr int16_t ADPCM_STEP[] = {
@@ -276,6 +465,31 @@ int16_t decodeVoiceSample(const VoiceClip &clip, uint32_t position,
   return static_cast<int16_t>(predictor * VOICE_GAIN * fade);
 }
 
+bool playVoiceClip(uint8_t clip_id) {
+  if (clip_id >= VOICE_CLIP_COUNT) return false;
+  const VoiceClip &clip = VOICE_CLIP_TABLE[clip_id];
+  int32_t predictor = 0;
+  int index = 0;
+  for (uint32_t played = 0; played < clip.samples;) {
+    pollDial();
+    if (handsetDown()) return false;
+    const size_t frames = min(static_cast<uint32_t>(FRAMES_PER_READ),
+                              clip.samples - played);
+    for (size_t frame = 0; frame < frames; ++frame) {
+      const int16_t value = decodeVoiceSample(clip, played + frame,
+                                               predictor, index);
+      stereo_chunk[frame * 2] = value;
+      stereo_chunk[frame * 2 + 1] = value;
+    }
+    size_t written = 0;
+    if (i2s_write(SPEAKER_PORT, stereo_chunk, frames * 2 * sizeof(int16_t),
+                  &written, portMAX_DELAY) != ESP_OK ||
+        written != frames * 2 * sizeof(int16_t)) return false;
+    played += frames;
+  }
+  return true;
+}
+
 void playVoiceClips() {
   uint8_t count = 0;
   if (!readNetworkBytes(&count, 1) || count == 0 || count > 16) {
@@ -288,36 +502,10 @@ void playVoiceClips() {
     return;
   }
   for (uint8_t clip_number = 0; clip_number < count; ++clip_number) {
-    if (clip_ids[clip_number] >= VOICE_CLIP_COUNT) {
-      phone_client.println("CLIPS ERROR");
+    if (!playVoiceClip(clip_ids[clip_number])) {
+      i2s_zero_dma_buffer(SPEAKER_PORT);
+      phone_client.println(handsetDown() ? "ABORTED" : "SPEAKER ERROR");
       return;
-    }
-    const VoiceClip &clip = VOICE_CLIP_TABLE[clip_ids[clip_number]];
-    int32_t predictor = 0;
-    int index = 0;
-    for (uint32_t played = 0; played < clip.samples;) {
-      pollDial();
-      if (handsetDown()) {
-        i2s_zero_dma_buffer(SPEAKER_PORT);
-        phone_client.println("ABORTED");
-        return;
-      }
-      const size_t frames = min(static_cast<uint32_t>(FRAMES_PER_READ),
-                                clip.samples - played);
-      for (size_t frame = 0; frame < frames; ++frame) {
-        const int16_t value = decodeVoiceSample(clip, played + frame,
-                                                 predictor, index);
-        stereo_chunk[frame * 2] = value;
-        stereo_chunk[frame * 2 + 1] = value;
-      }
-      size_t written = 0;
-      if (i2s_write(SPEAKER_PORT, stereo_chunk, frames * 2 * sizeof(int16_t),
-                    &written, portMAX_DELAY) != ESP_OK ||
-          written != frames * 2 * sizeof(int16_t)) {
-        phone_client.println("SPEAKER ERROR");
-        return;
-      }
-      played += frames;
     }
   }
   delay(50);
@@ -327,40 +515,88 @@ void playVoiceClips() {
 
 void playHostAudio() {
   uint32_t sample_count = 0;
+  uint8_t intro_clip = 255;
   if (!readNetworkBytes(reinterpret_cast<uint8_t *>(&sample_count), 4) ||
-      sample_count == 0 || sample_count > RECORD_RATE * 30) {
+      !readNetworkBytes(&intro_clip, 1) ||
+      sample_count == 0 || sample_count > RECORD_RATE * 30 ||
+      (intro_clip != 255 && intro_clip >= VOICE_CLIP_COUNT)) {
     phone_client.println("PLAY ERROR");
+    phone_client.stop();
+    return;
+  }
+  if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+  File audio = SPIFFS.open(AUDIO_FILE, FILE_WRITE);
+  if (!audio) {
+    phone_client.println("PLAY ERROR");
+    phone_client.stop();
+    return;
+  }
+  size_t remaining = sample_count * sizeof(int16_t);
+  while (remaining > 0) {
+    if (handsetDown(false)) {
+      audio.close();
+      if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+      phone_client.stop();
+      return;
+    }
+    const size_t bytes = min(remaining, sizeof(host_play_chunk));
+    if (!readNetworkBytes(reinterpret_cast<uint8_t *>(host_play_chunk), bytes) ||
+        !writeAudioFile(audio, reinterpret_cast<const uint8_t *>(host_play_chunk), bytes)) {
+      audio.close();
+      if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+      phone_client.stop();
+      return;
+    }
+    remaining -= bytes;
+  }
+  audio.close();
+  audio = SPIFFS.open(AUDIO_FILE, FILE_READ);
+  if (!audio) {
+    phone_client.println("PLAY ERROR");
+    if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+    return;
+  }
+  if (intro_clip != 255 && !playVoiceClip(intro_clip)) {
+    audio.close();
+    if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+    i2s_zero_dma_buffer(SPEAKER_PORT);
+    phone_client.println(handsetDown() ? "ABORTED" : "SPEAKER ERROR");
     return;
   }
   uint32_t played = 0;
-  phone_client.println("NEXT");
   while (played < sample_count) {
     pollDial();
     if (handsetDown()) {
+      audio.close();
+      if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
       i2s_zero_dma_buffer(SPEAKER_PORT);
-      phone_client.stop(); // Discard any prefetched audio on hangup.
+      phone_client.println("ABORTED");
       return;
     }
     const size_t frames = min(static_cast<uint32_t>(HOST_PLAY_FRAMES),
                               sample_count - played);
-    if (!readNetworkBytes(reinterpret_cast<uint8_t *>(host_play_chunk),
-                         frames * sizeof(int16_t))) {
+    if (audio.readBytes(reinterpret_cast<char *>(host_play_chunk),
+                        frames * sizeof(int16_t)) != frames * sizeof(int16_t)) {
+      audio.close();
+      if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
       phone_client.println("PLAY ERROR");
       return;
     }
-    // Ask for the next block while this one plays through the I2S DMA buffer.
-    if (played + frames < sample_count) phone_client.println("NEXT");
     pollDial();
     if (handsetDown()) {
+      audio.close();
+      if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
       i2s_zero_dma_buffer(SPEAKER_PORT);
-      phone_client.stop();
+      phone_client.println("ABORTED");
       return;
     }
     for (size_t offset = 0; offset < frames; offset += FRAMES_PER_READ) {
       pollDial();
       if (handsetDown()) {
+        audio.close();
+        if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
         i2s_zero_dma_buffer(SPEAKER_PORT);
-        phone_client.stop();
+        phone_client.println("ABORTED");
         return;
       }
       const size_t block = min(FRAMES_PER_READ, frames - offset);
@@ -373,12 +609,18 @@ void playHostAudio() {
       if (i2s_write(SPEAKER_PORT, stereo_chunk, block * 2 * sizeof(int16_t),
                     &written, portMAX_DELAY) != ESP_OK ||
           written != block * 2 * sizeof(int16_t)) {
+        audio.close();
+        if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
         phone_client.println("PLAY ERROR");
         return;
       }
     }
     played += frames;
   }
+  audio.close();
+  if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE);
+  PHONE_LOG_PRINTF("Temporary audio cleared; SPIFFS used: %u bytes\n",
+                static_cast<unsigned>(SPIFFS.usedBytes()));
   delay(80);
   i2s_zero_dma_buffer(SPEAKER_PORT);
   phone_client.println(handsetDown() ? "ABORTED" : "PLAYED");
@@ -474,11 +716,11 @@ bool playBeep() {
 void setup() {
   Serial.begin(460800);
   delay(500);
-  Serial.println("Phone client ready");
+  PHONE_LOG_PRINTLN("Phone client ready");
   pinMode(PIN_DIAL_RR, INPUT_PULLUP);
   dial_reported_level = digitalRead(PIN_DIAL_RR);
   attachInterrupt(digitalPinToInterrupt(PIN_DIAL_RR), onDialEdge, CHANGE);
-  Serial.printf("Dial RR initial: %s\n",
+  PHONE_LOG_PRINTF("Dial RR initial: %s\n",
                 digitalRead(PIN_DIAL_RR) == LOW ? "GROUNDED" : "OPEN");
   pinMode(PIN_CRADLE, INPUT_PULLUP);
   #if PHONE_CRADLE_PIN == 32
@@ -492,7 +734,7 @@ void setup() {
   #endif
   cradle_raw = cradle_stable = cradle_adc < CRADLE_UP_BELOW ? HIGH : LOW;
   cradle_changed_at = cradle_sampled_at = millis();
-  Serial.printf("Cradle initial: %s; ADC: %d\n",
+  PHONE_LOG_PRINTF("Cradle initial: %s; ADC: %d\n",
                 cradle_stable == LOW ? "DOWN" : "UP", cradle_adc);
 
   i2s_config_t config = {};
@@ -502,7 +744,7 @@ void setup() {
   config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   config.intr_alloc_flags = 0;
-  config.dma_buf_count = 4;
+  config.dma_buf_count = 16;
   config.dma_buf_len = FRAMES_PER_READ;
   config.use_apll = false;
 
@@ -515,7 +757,7 @@ void setup() {
   esp_err_t error = i2s_driver_install(I2S_PORT, &config, 0, nullptr);
   if (error == ESP_OK) error = i2s_set_pin(I2S_PORT, &pins);
   if (error != ESP_OK) {
-    Serial.printf("I2S setup failed: %d\n", error);
+    PHONE_LOG_PRINTF("I2S setup failed: %d\n", error);
     while (true) delay(1000);
   }
 
@@ -525,7 +767,7 @@ void setup() {
   // explicitly here because both settings are required for this microphone.
   REG_SET_FIELD(I2S_TIMING_REG(I2S_PORT), I2S_RX_SD_IN_DELAY, 2);
   REG_SET_BIT(I2S_CONF_REG(I2S_PORT), I2S_RX_MSB_SHIFT);
-  Serial.printf("I2S timing: input delay=%u, MSB shift=%u\n",
+  PHONE_LOG_PRINTF("I2S timing: input delay=%u, MSB shift=%u\n",
                 static_cast<unsigned>(REG_GET_FIELD(I2S_TIMING_REG(I2S_PORT),
                                                      I2S_RX_SD_IN_DELAY)),
                 !!(REG_READ(I2S_CONF_REG(I2S_PORT)) & I2S_RX_MSB_SHIFT));
@@ -551,25 +793,21 @@ void setup() {
   error = i2s_driver_install(SPEAKER_PORT, &speaker_config, 0, nullptr);
   if (error == ESP_OK) error = i2s_set_pin(SPEAKER_PORT, &speaker_pins);
   if (error != ESP_OK) {
-    Serial.printf("Speaker I2S setup failed: %d\n", error);
+    PHONE_LOG_PRINTF("Speaker I2S setup failed: %d\n", error);
     while (true) delay(1000);
   }
   i2s_zero_dma_buffer(SPEAKER_PORT);
-  Serial.printf("Audio memory: prompt=flash, messages=streamed; free heap: %u\n",
+  if (!SPIFFS.begin(true)) {
+    PHONE_LOG_PRINTLN("Temporary audio storage unavailable");
+    while (true) delay(1000);
+  }
+  if (SPIFFS.exists(AUDIO_FILE)) SPIFFS.remove(AUDIO_FILE); // Drop an interrupted transfer from an earlier boot.
+  PHONE_LOG_PRINTF("Temporary audio storage: %u bytes free\n",
+                static_cast<unsigned>(SPIFFS.totalBytes() - SPIFFS.usedBytes()));
+  PHONE_LOG_PRINTF("Audio memory: prompt=flash, messages=temporary flash; free heap: %u\n",
                 ESP.getFreeHeap());
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(PHONE_WIFI_SSID, PHONE_WIFI_PASSWORD);
-  Serial.printf("Joining Wi-Fi: %s\n", PHONE_WIFI_SSID);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-  }
-  if (!MDNS.begin("secrets-phone")) {
-    Serial.println("mDNS name unavailable; use the printed IP address");
-  }
-  Serial.printf("Phone Wi-Fi: %s at %s; laptop: %s:%u; free heap: %u\n",
-                PHONE_WIFI_SSID, WiFi.localIP().toString().c_str(),
-                PHONE_SERVER_HOST, PHONE_PORT, ESP.getFreeHeap());
+  phone_client.begin();
+  PHONE_LOG_PRINTF("Free heap after transport setup: %u\n", ESP.getFreeHeap());
 }
 
 bool pollNetworkCommand() {
@@ -597,8 +835,20 @@ bool pollNetworkCommand() {
     }
     if (command == 'o') playMenu(true);
     if (command == 'm') playMenu(false);
-    if (command == 'R') recordHostAudio();
-    if (command == 'P') playHostAudio();
+    if (command == 'R') {
+#if PHONE_CONNECTION_MODE == PHONE_CONNECTION_USB
+      recordUsbAudio();
+#else
+      recordHostAudio();
+#endif
+    }
+    if (command == 'P') {
+#if PHONE_CONNECTION_MODE == PHONE_CONNECTION_USB
+      playUsbAudio();
+#else
+      playHostAudio();
+#endif
+    }
     if (command == 'C') playVoiceClips();
     if (command == 'b') {
       phone_client.println(playBeep() ? "BEEPED" : "ABORTED");
@@ -609,14 +859,15 @@ bool pollNetworkCommand() {
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
+  if (!phone_client.ready()) {
     phone_client.stop();
     delay(100);
     return;
   }
-  if (phone_client.connected() &&
+  if (PHONE_CONNECTION_MODE != PHONE_CONNECTION_USB &&
+      phone_client.connected() &&
       millis() - last_server_contact_at > SERVER_IDLE_TIMEOUT_MS) {
-    Serial.println("Laptop timed out; reconnecting");
+    PHONE_LOG_PRINTLN("Laptop timed out; reconnecting");
     phone_client.stop();
   }
   if (!phone_client.connected()) {
@@ -626,15 +877,7 @@ void loop() {
     if (last_server_attempt_at == 0 ||
         now - last_server_attempt_at >= SERVER_RETRY_MS) {
       last_server_attempt_at = now;
-      IPAddress server_address;
-      if (!server_address.fromString(PHONE_SERVER_HOST)) {
-        server_address = MDNS.queryHost(PHONE_SERVER_HOST, 2000);
-      }
-      if (server_address == IPAddress()) {
-        Serial.printf("Laptop %s not found; retrying\n", PHONE_SERVER_HOST);
-      } else if (phone_client.connect(server_address, PHONE_PORT, 2000)) {
-        phone_client.setNoDelay(true);
-        phone_client.setTimeout(3000);
+      if (phone_client.acceptOrConnect()) {
         last_server_contact_at = millis();
         command_length = 0;
         noInterrupts();
@@ -642,11 +885,6 @@ void loop() {
         interrupts();
         dial_pending_edges = 0;
         dial_turn_at_lift = dial_turn_id;
-        Serial.printf("Connected to laptop at %s:%u\n",
-                      server_address.toString().c_str(), PHONE_PORT);
-      } else {
-        Serial.printf("Laptop %s:%u unavailable; retrying\n",
-                      server_address.toString().c_str(), PHONE_PORT);
       }
     }
     delay(10);
@@ -660,7 +898,7 @@ void loop() {
   esp_err_t error = i2s_read(I2S_PORT, samples, sizeof(samples),
                              &bytes_read, pdMS_TO_TICKS(1000));
   if (error != ESP_OK || bytes_read == 0) {
-    Serial.printf("I2S read failed: %d, bytes: %u\n", error,
+    PHONE_LOG_PRINTF("I2S read failed: %d, bytes: %u\n", error,
                   static_cast<unsigned>(bytes_read));
     delay(500);
     return;

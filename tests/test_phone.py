@@ -31,6 +31,16 @@ class FakePort:
 
 
 class PhoneTests(unittest.TestCase):
+    def test_usb_playback_waits_for_each_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw = bytes(index % 256 for index in range(4098))
+            port = FakePort(b"NEXT\n" * 17 + b"PLAYED\n")
+            phone = Phone(port, Path(directory))
+            phone.serial_pacing = True
+            phone.play(raw)
+            self.assertEqual(port.sent, b"RPH1:P\n" +
+                             struct.pack("<IB", 2049, 255) + raw)
+
     def test_idle_phone_detects_stale_connection_after_reboot(self):
         with tempfile.TemporaryDirectory() as directory:
             port = FakePort(b"HOST MODE\n")
@@ -41,17 +51,17 @@ class PhoneTests(unittest.TestCase):
                     phone.run()
             self.assertEqual(port.sent.count(b"RPH1:H\n"), 2)
 
-    def test_tcp_playback_streams_bounded_chunks(self):
+    def test_tcp_playback_transfers_audio_before_playing(self):
         left, right = socket.socketpair()
         received = []
 
         def device():
             try:
                 self.assertEqual(right.recv(7), b"RPH1:P\n")
-                count = struct.unpack("<I", right.recv(4))[0]
+                count, intro_id = struct.unpack("<IB", right.recv(5))
                 self.assertEqual(count, 2049)
+                self.assertEqual(intro_id, VOICE_CLIPS.index("here_message"))
                 for frames in (1024, 1024, 1):
-                    right.sendall(b"NEXT\n")
                     chunk = bytearray()
                     while len(chunk) < frames * 2:
                         chunk.extend(right.recv(frames * 2 - len(chunk)))
@@ -67,7 +77,7 @@ class PhoneTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 phone = Phone(SocketPort(left), Path(directory))
                 raw = bytes((index % 256 for index in range(2049 * 2)))
-                phone.play(raw)
+                phone.play(raw, intro_clip="here_message")
                 self.assertEqual(b"".join(received), raw)
         finally:
             left.close()
@@ -137,7 +147,8 @@ class PhoneTests(unittest.TestCase):
             spoken = []
             phone.speak_clips = lambda *names: spoken.append(names)
             phone.record = lambda: bytes(RATE * 10 * 2)
-            phone.play = lambda raw: None
+            played = []
+            phone.play = lambda raw, intro_clip=None: played.append(intro_clip)
             phone.beep = lambda: beeps.append(True)
             with patch.object(phone, "available_key", return_value="919"):
                 phone.leave_message()
@@ -147,9 +158,10 @@ class PhoneTests(unittest.TestCase):
             files = list(Path(directory).glob("*.wav"))
             self.assertEqual(len(files), 1)
             self.assertEqual(files[0].stem, "919")
-            self.assertEqual(len(beeps), 2)  # Start and end of recording.
+            self.assertEqual(len(beeps), 1)  # The ESP32 plays the end beep locally.
             phone.fetch_message(files[0].stem)
-            self.assertEqual(len(beeps), 3)
+            self.assertEqual(played, ["here_message"])
+            self.assertEqual(len(beeps), 2)
 
     def test_repeated_events_do_not_repeat_actions(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,6 +1,6 @@
 # Wireless rotary phone message system
 
-The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone, and drives a MAX98357A amplifier. It joins the same 2.4 GHz Wi-Fi network as the laptop. The opening menu and all reusable Cori speech clips are stored in ESP32 flash and play locally. The laptop stores callers' messages and streams those recordings when requested. USB is needed to flash the ESP32 and can then be replaced with a USB wall adapter or power bank for power; commands and caller audio travel over Wi-Fi TCP.
+The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone, and drives a MAX98357A amplifier. One firmware supports USB serial, shared 2.4 GHz Wi-Fi, and an ESP32-hosted Wi-Fi network. The opening menu and reusable Cori speech clips are stored in ESP32 flash and play locally. The laptop stores callers' messages. The ESP32 temporarily buffers a whole message in flash before uploading or playing it, so link pauses cannot interrupt live audio.
 
 ## Layout
 
@@ -20,32 +20,52 @@ The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone,
 | MAX98357A | BCLK, LRC, DIN | GPIO14, GPIO27, GPIO22 |
 | Phone cradle | F/A terminals | GND, GPIO4 or GPIO32 |
 | Rotary dial | F, RR | GND, GPIO5 |
+| SD card reader | GND, VCC | GND, 3V3 |
+| SD card reader | MISO, MOSI, SCK, CS | GPIO19, GPIO23, GPIO18, GPIO13 |
 
 Set `PHONE_CRADLE_PIN` in `client/include/network_config.h` to match the cradle wire. The example uses GPIO4, matching this phone's original wiring. That mode senses a digital high/low level because Wi-Fi prevents ADC2 readings on the original ESP32. GPIO32 is available for ADC1 sensing if the wire is moved. Verify both handset positions after flashing. The other cradle wire stays on GND. Connect the speaker to both amplifier output terminals, never to ESP32 GPIO or GND. All devices share a ground. GPIO5 is a startup strapping pin, so verify the board still boots with the dial connected.
 
+To check the SD reader before changing the phone firmware, insert a FAT32-formatted card and run:
+
+```sh
+pio run -d client -e sd-card-check -t upload --upload-port /dev/cu.usbserial-0001
+pio device monitor -p /dev/cu.usbserial-0001 -b 115200
+```
+
+Reset the ESP32 with the monitor open if the startup text was missed. `PASS` means the card mounted and a test file was written, read back, and removed. The check touches only `/rotary_sd_check.txt`; other files are left alone. This is a separate diagnostic firmware, so upload the normal `esp32doit-devkit-v1` environment afterward to return to phone operation.
+
 ## Configure and run
 
-Copy `client/include/network_config.h.example` to `client/include/network_config.h` and enter the Wi-Fi network name and password used by the laptop. Set `PHONE_SERVER_HOST` to the laptop's local network name (without `.local`) or its IP address. On a Mac, `scutil --get LocalHostName` prints the name. The real config file is ignored by Git.
+Copy `client/include/network_config.h.example` to `client/include/network_config.h`. Set `PHONE_CONNECTION_MODE` to `PHONE_CONNECTION_USB`, `PHONE_CONNECTION_SHARED_WIFI`, or `PHONE_CONNECTION_ESP32_AP`. The same phone behavior and audio protocol run in all three modes. The real config file is ignored by Git.
+
+In shared Wi-Fi mode, enter the Wi-Fi name and password used by the laptop. Set `PHONE_SERVER_HOST` to the laptop's local network name (without `.local`) or IP address. On a Mac, `scutil --get LocalHostName` prints the name. In ESP32 AP mode, choose a distinct network name and password (at least eight characters).
 
 ```sh
 cp client/include/network_config.h.example client/include/network_config.h
-# Edit PHONE_WIFI_SSID, PHONE_WIFI_PASSWORD, and PHONE_SERVER_HOST
+# Edit PHONE_CONNECTION_MODE and the settings for that mode
 pio run -d client -t upload
 ```
 
-Leave the laptop on the same Wi-Fi network and start its program:
+Start the matching laptop mode. USB mode needs `pyserial` (`python3 -m pip install pyserial`):
 
 ```sh
-python3 server/phone.py
+python3 server/phone.py --connection usb --serial-port /dev/cu.usbserial-0001
+python3 server/phone.py --connection shared-wifi
 ```
 
-The laptop listens on TCP port `45679`. The ESP32 looks up the laptop and connects on boot, then reconnects if the link drops. A dead call session times out and closes while the laptop keeps listening for a new connection. If local name resolution is unavailable, set `PHONE_SERVER_HOST` to the laptop's current IP address and flash again. The laptop needs no Python packages beyond the standard library to run the server. Keep the ESP32 powered from a wall adapter or power bank when unplugging it from the laptop.
+For ESP32 AP mode, join the laptop to `PHONE_AP_SSID`, then start:
+
+```sh
+python3 server/phone.py --connection esp32-ap
+```
+
+In shared mode, the laptop listens on TCP port `45679` and the ESP32 connects to it. In ESP32 AP mode, the ESP32 listens at `192.168.4.1:45679` and the laptop connects to it. In USB mode, the same audio commands and replies use serial at 460800 baud. The laptop service reconnects after a lost link. Wi-Fi modes need no Python packages beyond the standard library. For wireless use, keep the ESP32 powered from a wall adapter or power bank. A laptop using the ESP32 network generally needs another connection for internet access.
 
 Put the handset down, then lift it. The phone says “This is the Secrets Hotline” and gives the dial instructions. After 15 seconds of inactivity it repeats only the instructions. Starting to dial skips the rest of the menu. Dial **0** to record a ten-second message, or dial a three-digit key using **1–9** to hear one. A beep marks the beginning and end of recording and follows playback. Hanging up aborts the current action. A missing key can be retried without hanging up.
 
 At server startup, all 729 three-digit keys made from 1–9 are shuffled, excluding keys whose message files already exist. Each key is issued at most once during that server run. Restarting the server reshuffles the available keys. Copy `server/data/` to another laptop if you want to keep saved messages.
 
-The microphone produces 16 kHz, 16-bit mono PCM: 32 KB per second. A ten-second caller message is about 320 KB. Audio is sent in small TCP chunks, so the ESP32 never stores a complete caller recording. The laptop saves each message as a WAV file. The 16 reusable speech clips are compressed to about 165 KB in firmware flash; their playback needs no audio transfer from the laptop, though the laptop still chooses which clip to play. The current firmware occupies about 1.17 MB of its 1.31 MB application partition, leaving insufficient room for a collection of caller messages. The client reconnects when the Wi-Fi link or laptop service returns.
+The microphone produces 16 kHz, 16-bit mono PCM: 32 KB per second. A ten-second caller message is about 320 KB. In USB mode, recording streams to the laptop as it is captured, and playback uses small chunks paced by the ESP32; neither operation writes the temporary flash file. In either Wi-Fi mode, the ESP32 writes one temporary SPIFFS file while recording, then uploads it. For playback it downloads the whole message into that file before speaking the introduction and playing it. The temporary file is deleted after each operation, after a hang-up or error, and on boot. The laptop saves each message as a WAV file. The reusable speech clips are embedded in firmware flash. Repeated Wi-Fi recordings contribute to flash wear; USB mode avoids that temporary flash write. The client reconnects when the Wi-Fi link or laptop service returns.
 
 ## Change the voice or menu
 
