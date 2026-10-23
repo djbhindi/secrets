@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SPIFFS.h>
+#include <SD.h>
+#include <SPI.h>
 #include <driver/i2s.h>
 #include <driver/adc.h>
 #include <driver/rtc_io.h>
@@ -74,6 +76,11 @@ int dial_reported_level = HIGH;
 uint32_t dial_pending_edges = 0;
 uint32_t dial_turn_id = 0;
 uint32_t dial_turn_at_lift = 0;
+#if PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD
+uint8_t sd_dial_queue[8] = {};
+uint8_t sd_dial_read = 0;
+uint8_t sd_dial_write = 0;
+#endif
 char command_buffer[16] = {};
 size_t command_length = 0;
 
@@ -100,9 +107,11 @@ void pollDial() {
     dial_pending_edges += edges - dial_reported_edges;
     dial_reported_edges = edges;
     dial_reported_level = level;
+#if PHONE_CONNECTION_MODE != PHONE_CONNECTION_SD
     phone_client.printf("Dial RR: %s; edges: %lu\n",
                   level == LOW ? "GROUNDED" : "OPEN",
                   static_cast<unsigned long>(edges));
+#endif
   }
   if (dial_pending_edges == 0 ||
       static_cast<uint32_t>(micros() - last_edge_us) < DIAL_SETTLE_US) return;
@@ -110,6 +119,18 @@ void pollDial() {
   const uint32_t turn_edges = dial_pending_edges;
   dial_pending_edges = 0;
   ++dial_turn_id;
+#if PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD
+  const uint8_t next = (sd_dial_write + 1) % 8;
+  if (next != sd_dial_read) {
+    sd_dial_queue[sd_dial_write] = turn_edges;
+    sd_dial_write = next;
+  } else {
+    PHONE_LOG_PRINTLN("Dial queue full; turn ignored");
+  }
+  PHONE_LOG_PRINTF("Dial: %lu edges; turn %lu\n",
+                   static_cast<unsigned long>(turn_edges),
+                   static_cast<unsigned long>(dial_turn_id));
+#else
   if (turn_edges == 20) {
     phone_client.printf("TRIGGER (%lu edges; turn %lu)\n",
                   static_cast<unsigned long>(turn_edges),
@@ -124,12 +145,18 @@ void pollDial() {
                   static_cast<unsigned long>(turn_edges),
                   static_cast<unsigned long>(dial_turn_id));
   }
+#endif
 }
 
 void pollCradle(bool report = true) {
   if (report && cradle_event_pending) {
+#if PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD
+    PHONE_LOG_PRINTF("Cradle %s; ADC: %d\n",
+                  cradle_stable == LOW ? "DOWN" : "UP", cradle_adc);
+#else
     phone_client.printf("Cradle %s; ADC: %d\n",
                   cradle_stable == LOW ? "DOWN" : "UP", cradle_adc);
+#endif
     cradle_event_pending = false;
   }
   const unsigned long now = millis();
@@ -157,8 +184,13 @@ void pollCradle(bool report = true) {
     cradle_stable = reading;
     if (reading == HIGH) dial_turn_at_lift = dial_turn_id;
     if (report) {
+#if PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD
+      PHONE_LOG_PRINTF("Cradle %s; ADC: %d\n",
+                    reading == LOW ? "DOWN" : "UP", cradle_adc);
+#else
       phone_client.printf("Cradle %s; ADC: %d\n",
                     reading == LOW ? "DOWN" : "UP", cradle_adc);
+#endif
     } else {
       cradle_event_pending = true;
     }
@@ -713,6 +745,10 @@ bool playBeep() {
   return !handsetDown();
 }
 
+#if PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD
+#include "sd_phone.h"
+#endif
+
 void setup() {
   Serial.begin(460800);
   delay(500);
@@ -779,7 +815,8 @@ void setup() {
   speaker_config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   speaker_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   speaker_config.intr_alloc_flags = 0;
-  speaker_config.dma_buf_count = 4;
+  speaker_config.dma_buf_count =
+      PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD ? 12 : 4;
   speaker_config.dma_buf_len = FRAMES_PER_READ;
   speaker_config.use_apll = false;
   speaker_config.tx_desc_auto_clear = true;
@@ -797,6 +834,9 @@ void setup() {
     while (true) delay(1000);
   }
   i2s_zero_dma_buffer(SPEAKER_PORT);
+#if PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD
+  setupSdPhone();
+#else
   if (!SPIFFS.begin(true)) {
     PHONE_LOG_PRINTLN("Temporary audio storage unavailable");
     while (true) delay(1000);
@@ -808,6 +848,7 @@ void setup() {
                 ESP.getFreeHeap());
   phone_client.begin();
   PHONE_LOG_PRINTF("Free heap after transport setup: %u\n", ESP.getFreeHeap());
+#endif
 }
 
 bool pollNetworkCommand() {
@@ -859,6 +900,10 @@ bool pollNetworkCommand() {
 }
 
 void loop() {
+#if PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD
+  loopSdPhone();
+  return;
+#endif
   if (!phone_client.ready()) {
     phone_client.stop();
     delay(100);

@@ -1,8 +1,9 @@
 #pragma once
 
 // Copy to network_config.h (Git ignores it). Select one transport:
-// USB serial, an existing 2.4 GHz network, or ESP32-hosted Wi-Fi.
-#define PHONE_CONNECTION_MODE PHONE_CONNECTION_USB
+// SD card standalone, USB serial, an existing 2.4 GHz network, or ESP32-hosted Wi-Fi.
+// SD mode needs no laptop service or Wi-Fi credentials.
+#define PHONE_CONNECTION_MODE PHONE_CONNECTION_SD
 
 // Used in PHONE_CONNECTION_SHARED_WIFI mode.
 #define PHONE_WIFI_SSID "your-wifi-name"
