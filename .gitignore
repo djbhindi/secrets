@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 .DS_Store
 client/include/network_config.h
+sd_card/

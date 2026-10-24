@@ -10,7 +10,7 @@ from voice import DEFAULT_MODEL, RATE, ROOT, render_16k, soften_low_mids
 
 
 PHRASES = {
-    "record_after_beep": "Leave your message after the beep.",
+    "record_after_beep": "Record a message up to two minutes long after the beep, or dial zero when you're done.",
     "store_full": "The message store is full.",
     "here_message": "Here is your message.",
     "your_code": "Your message is saved. Your three digit code is",

@@ -2,7 +2,11 @@
 
 // Standalone phone. Messages are standard 16 kHz mono WAV files on microSD.
 constexpr int SD_CS_PIN = 13;
-constexpr char SD_TEMP_FILE[] = "/RECORD.TMP";
+constexpr char SD_RECORDING_DIR[] = "/secrets_hotline";
+constexpr char SD_TEMP_FILE[] = "/secrets_hotline/RECORD.TMP";
+constexpr uint32_t SD_RECORD_SAMPLES = RECORD_RATE * 120;
+constexpr uint32_t SD_DIAL_END_TRIM_SAMPLES = RECORD_RATE * 2;
+constexpr unsigned long SD_PICKUP_PAUSE_MS = 1500;
 constexpr unsigned long MENU_REPEAT_MS = 15000;
 bool sd_ready = false;
 unsigned long sd_mount_attempt_at = 0;
@@ -15,12 +19,28 @@ uint16_t sd_next_key = 0;
 uint16_t sd_key_stride = 1;
 
 void sdFileName(unsigned key, char *path) {
-  snprintf(path, 13, "/MSG%03u.WAV", key);
+  snprintf(path, 32, "/secrets_hotline/MSG%03u.WAV", key);
+}
+
+bool sdMessageExists(unsigned key) {
+  char path[32];
+  sdFileName(key, path);
+  return SD.exists(path);
+}
+
+bool sdPrepareCard() {
+  if (!SD.exists(SD_RECORDING_DIR) && !SD.mkdir(SD_RECORDING_DIR)) return false;
+  if (SD.exists(SD_TEMP_FILE)) SD.remove(SD_TEMP_FILE);
+  return true;
 }
 
 unsigned sdKeyAt(uint16_t index) {
   const unsigned n = index % 729;
   return 100 * (n / 81 + 1) + 10 * ((n / 9) % 9 + 1) + n % 9 + 1;
+}
+
+bool sdReservedKey(unsigned key) {
+  return key == 777 || key == 666 || key == 911;
 }
 
 bool sdAllocateKey(unsigned &key) {
@@ -29,9 +49,11 @@ bool sdAllocateKey(unsigned &key) {
     sd_next_key = (sd_next_key + sd_key_stride) % 729;
     if (sd_issued[index]) continue;
     const unsigned candidate = sdKeyAt(index);
-    char path[13];
-    sdFileName(candidate, path);
-    if (SD.exists(path)) {
+    if (sdReservedKey(candidate)) {
+      sd_issued[index] = true;
+      continue;
+    }
+    if (sdMessageExists(candidate)) {
       sd_issued[index] = true;
       continue;
     }
@@ -47,7 +69,8 @@ void sdWavHeader(uint8_t *header, uint32_t samples_count) {
   memset(header, 0, 44);
   memcpy(header, "RIFF", 4);
   const uint32_t data_bytes = samples_count * 2;
-  const uint32_t riff_bytes = data_bytes + 36;
+  // The final 16 bytes contain playback levels in a standard extra WAV chunk.
+  const uint32_t riff_bytes = data_bytes + 36 + 16;
   memcpy(header + 4, &riff_bytes, 4);
   memcpy(header + 8, "WAVEfmt ", 8);
   const uint32_t fmt_bytes = 16;
@@ -62,30 +85,53 @@ void sdWavHeader(uint8_t *header, uint32_t samples_count) {
   memcpy(header + 40, &data_bytes, 4);
 }
 
-bool sdRecord(unsigned key) {
+enum class SdRecordResult { Failed, TimedOut, DialEnded, HungUp };
+
+SdRecordResult sdRecord(unsigned key) {
   if (SD.exists(SD_TEMP_FILE)) SD.remove(SD_TEMP_FILE);
   File file = SD.open(SD_TEMP_FILE, FILE_WRITE);
-  if (!file) return false;
+  if (!file) return SdRecordResult::Failed;
   uint8_t header[44];
-  sdWavHeader(header, HOST_RECORD_SAMPLES);
+  sdWavHeader(header, 0);
   bool ok = file.write(header, sizeof(header)) == sizeof(header);
   uint32_t captured = 0;
   size_t buffered = 0;
+  int32_t minimum = 32767;
+  int32_t maximum = -32768;
+  int64_t sum = 0;
+  uint32_t measured = 0;
+  bool dial_ended = false;
+  sd_dial_read = sd_dial_write;
   if (ok) discardMicStartup();
   const unsigned long started = millis();
-  while (ok && captured < HOST_RECORD_SAMPLES && !handsetDown(false)) {
+  while (ok && captured < SD_RECORD_SAMPLES && !handsetDown(false)) {
+    pollDial();
+    while (sd_dial_read != sd_dial_write) {
+      const uint8_t edges = sd_dial_queue[sd_dial_read];
+      sd_dial_read = (sd_dial_read + 1) % 8;
+      if (edges == 20 || edges == 21) dial_ended = true;
+    }
+    if (dial_ended) break;
     size_t bytes_read = 0;
     if (i2s_read(I2S_PORT, samples, sizeof(samples), &bytes_read,
                  portMAX_DELAY) != ESP_OK) { ok = false; break; }
     const size_t frames = bytes_read / (2 * sizeof(int32_t));
     size_t count = 0;
     for (size_t frame = 0; frame + 1 < frames &&
-                           captured + count < HOST_RECORD_SAMPLES; frame += 2) {
+                           captured + count < SD_RECORD_SAMPLES; frame += 2) {
       const int32_t a = samples[frame * 2] >> 16;
       const int32_t b = samples[(frame + 1) * 2] >> 16;
       recording_chunk[count++] = static_cast<int16_t>((a + b) / 2);
     }
     if (count == 0) { ok = false; break; }
+    for (size_t i = 0; i < count; ++i) {
+      if (captured + i < RECORD_RATE * 15 / 100) continue;
+      const int32_t value = recording_chunk[i];
+      minimum = min(minimum, value);
+      maximum = max(maximum, value);
+      sum += value;
+      ++measured;
+    }
     const size_t bytes = count * sizeof(int16_t);
     if (buffered + bytes > sizeof(recording_file_chunk)) {
       ok = writeAudioFile(file, recording_file_chunk, buffered);
@@ -96,26 +142,48 @@ bool sdRecord(unsigned key) {
     buffered += bytes;
     captured += count;
     if (buffered == sizeof(recording_file_chunk) ||
-        captured == HOST_RECORD_SAMPLES) {
+        captured == SD_RECORD_SAMPLES) {
       ok = writeAudioFile(file, recording_file_chunk, buffered);
       buffered = 0;
     }
   }
-  file.close();
-  ok = ok && captured == HOST_RECORD_SAMPLES && !handsetDown(false);
+  const bool hung_up = handsetDown(false);
+  PHONE_LOG_PRINTF("SD stop: dial=%u, down=%u, adc=%d, write=%u, samples=%lu\n",
+                   dial_ended, hung_up, cradle_adc, ok,
+                   static_cast<unsigned long>(captured));
+  if (ok && buffered != 0) ok = writeAudioFile(file, recording_file_chunk, buffered);
+  ok = ok && captured != 0 && !hung_up;
   if (ok) {
-    char path[13]; sdFileName(key, path);
+    const int32_t mean = measured ? lround(static_cast<double>(sum) / measured) : 0;
+    const int32_t peak = measured ? max(abs(minimum - mean), abs(maximum - mean)) : 0;
+    uint8_t levels[16] = {};
+    memcpy(levels, dial_ended ? "LVL2" : "LVLS", 4);
+    const uint32_t chunk_bytes = 8;
+    memcpy(levels + 4, &chunk_bytes, 4);
+    memcpy(levels + 8, &mean, 4);
+    memcpy(levels + 12, &peak, 4);
+    ok = file.write(levels, sizeof(levels)) == sizeof(levels);
+  }
+  if (ok) {
+    sdWavHeader(header, captured);
+    ok = file.seek(0) && file.write(header, sizeof(header)) == sizeof(header);
+  }
+  file.close();
+  if (ok) {
+    char path[32]; sdFileName(key, path);
     ok = SD.rename(SD_TEMP_FILE, path);
   }
   if (!ok) SD.remove(SD_TEMP_FILE);
-  PHONE_LOG_PRINTF("SD capture: %lu samples, %lu ms, %s\n",
+  PHONE_LOG_PRINTF("SD capture: %lu samples, %lu ms, %s; down=%u, dial=%u\n",
       static_cast<unsigned long>(captured),
-      static_cast<unsigned long>(millis() - started), ok ? "saved" : "aborted");
-  return ok;
+      static_cast<unsigned long>(millis() - started), ok ? "saved" : "aborted",
+      hung_up, dial_ended);
+  if (!ok) return hung_up ? SdRecordResult::HungUp : SdRecordResult::Failed;
+  return dial_ended ? SdRecordResult::DialEnded : SdRecordResult::TimedOut;
 }
 
 bool sdPlay(unsigned key) {
-  char path[13]; sdFileName(key, path);
+  char path[32]; sdFileName(key, path);
   File file = SD.open(path, FILE_READ);
   if (!file) return false;
   uint8_t header[44];
@@ -128,44 +196,41 @@ bool sdPlay(unsigned key) {
   memcpy(&rate, header + 24, 4);
   memcpy(&data_bytes, header + 40, 4);
   ok = ok && rate == RECORD_RATE && data_bytes > 0 &&
-       data_bytes % 2 == 0 && data_bytes <= HOST_RECORD_SAMPLES * 2 &&
+       data_bytes % 2 == 0 && data_bytes <= SD_RECORD_SAMPLES * 2 &&
        file.size() >= 44 + data_bytes;
   if (!ok) { file.close(); return false; }
 
-  // Match the laptop's playback: remove the microphone's DC offset before
-  // setting voice gain. Check the file before announcing playback.
-  int32_t minimum = 32767;
-  int32_t maximum = -32768;
-  int64_t sum = 0;
-  uint32_t measured = 0;
-  uint32_t checked = 0;
-  while (checked < data_bytes) {
-    const size_t bytes = min(static_cast<uint32_t>(sizeof(recording_file_chunk)),
-                             data_bytes - checked);
-    if (file.read(recording_file_chunk, bytes) != bytes) {
-      file.close(); return false;
+  // Recording saved the microphone offset and peak, so playback needs no scan.
+  int32_t mean = 0;
+  int32_t peak = 0;
+  bool have_levels = false;
+  bool skip_tail = false;
+  if (file.size() >= 44 + data_bytes + 16 && file.seek(44 + data_bytes)) {
+    uint8_t levels[16];
+    if (file.read(levels, sizeof(levels)) == sizeof(levels) &&
+        (memcmp(levels, "LVLS", 4) == 0 || memcmp(levels, "LVL2", 4) == 0) &&
+        levels[4] == 8 &&
+        levels[5] == 0 && levels[6] == 0 && levels[7] == 0) {
+      skip_tail = memcmp(levels, "LVL2", 4) == 0;
+      memcpy(&mean, levels + 8, 4);
+      memcpy(&peak, levels + 12, 4);
+      have_levels = peak >= 0 && peak <= 65535 &&
+                    mean >= -32768 && mean <= 32767;
     }
-    for (size_t i = 0; i < bytes / 2; ++i) {
-      if (checked / 2 + i < RECORD_RATE * 15 / 100) continue;
-      int16_t sample;
-      memcpy(&sample, recording_file_chunk + i * 2, sizeof(sample));
-      const int32_t value = sample;
-      minimum = min(minimum, value);
-      maximum = max(maximum, value);
-      sum += value;
-      ++measured;
-    }
-    checked += bytes;
   }
-  const int32_t mean = measured ? lround(static_cast<double>(sum) / measured) : 0;
-  const int32_t peak = measured ? max(abs(minimum - mean), abs(maximum - mean)) : 0;
-  const float gain = peak ? min(8.0f, 7000.0f / peak) : 1.0f;
-  file.seek(44);
+  // Preloaded clips can be ordinary PCM WAV files without the recording levels.
+  // Those files play at their authored level; phone recordings retain auto gain.
+  const float gain = have_levels && peak ? min(8.0f, 7000.0f / peak) : 1.0f;
+  const uint32_t playable_bytes = skip_tail && data_bytes > RECORD_RATE
+      ? data_bytes - min(SD_DIAL_END_TRIM_SAMPLES * 2,
+                         data_bytes - static_cast<uint32_t>(RECORD_RATE))
+      : data_bytes;
+  if (!file.seek(44)) { file.close(); return false; }
   if (!playVoiceClip(2)) { file.close(); return false; }
   uint32_t played = 0;
-  while (played < data_bytes && !handsetDown(false)) {
+  while (played < playable_bytes && !handsetDown(false)) {
     const size_t bytes = min(static_cast<uint32_t>(sizeof(recording_file_chunk)),
-                             data_bytes - played);
+                             playable_bytes - played);
     if (file.read(recording_file_chunk, bytes) != bytes) {
       ok = false; break;
     }
@@ -178,7 +243,7 @@ bool sdPlay(unsigned key) {
       for (size_t i = 0; i < block; ++i) {
         const uint32_t sample_index = played / 2 + offset + i;
         const uint32_t edge = min(sample_index,
-                                  data_bytes / 2 - 1 - sample_index);
+                                  playable_bytes / 2 - 1 - sample_index);
         const float fade = min(1.0f, edge / 160.0f);
         const int32_t scaled = static_cast<int32_t>(
             (host_play_chunk[i] - mean) * gain * fade);
@@ -226,9 +291,11 @@ void sdHandleDigit(unsigned digit) {
     unsigned key = 0;
     if (!sdAllocateKey(key)) { playVoiceClip(1); return; }
     if (!playVoiceClip(0) || !playBeep()) return;
-    if (!sdRecord(key)) return;
-    if (!playBeep()) {
-      char path[13]; sdFileName(key, path);
+    const SdRecordResult result = sdRecord(key);
+    if (result == SdRecordResult::Failed || result == SdRecordResult::HungUp)
+      return;
+    if (!playBeep(true)) {
+      char path[32]; sdFileName(key, path);
       SD.remove(path);
       return;
     }
@@ -244,8 +311,7 @@ void sdHandleDigit(unsigned digit) {
   const unsigned key = (sd_entered[0] - '0') * 100 +
                        (sd_entered[1] - '0') * 10 + sd_entered[2] - '0';
   sd_entered_count = 0;
-  char path[13]; sdFileName(key, path);
-  if (SD.exists(path)) {
+  if (sdMessageExists(key)) {
     if (sdPlay(key)) playBeep();
   } else {
     if (playVoiceClip(5) && sdSpeakKey(key)) playVoiceClip(6);
@@ -258,7 +324,7 @@ void setupSdPhone() {
   SPI.begin(18, 19, 23, SD_CS_PIN);
   sd_mount_attempt_at = millis();
   sd_ready = SD.begin(SD_CS_PIN, SPI, 1000000) && SD.cardType() != CARD_NONE;
-  if (sd_ready && SD.exists(SD_TEMP_FILE)) SD.remove(SD_TEMP_FILE);
+  if (sd_ready) sd_ready = sdPrepareCard();
   sd_next_key = esp_random() % 729;
   do { sd_key_stride = 1 + esp_random() % 728; } while (sd_key_stride % 3 == 0);
   sd_previous_up = cradle_stable == HIGH;
@@ -274,8 +340,8 @@ void loopSdPhone() {
     SD.end();
     digitalWrite(SD_CS_PIN, HIGH);
     sd_ready = SD.begin(SD_CS_PIN, SPI, 1000000) && SD.cardType() != CARD_NONE;
+    if (sd_ready) sd_ready = sdPrepareCard();
     if (sd_ready) {
-      if (SD.exists(SD_TEMP_FILE)) SD.remove(SD_TEMP_FILE);
       PHONE_LOG_PRINTF("SD card mounted: %llu MB\n",
                        SD.cardSize() / (1024ULL * 1024ULL));
     } else {
@@ -295,8 +361,18 @@ void loopSdPhone() {
     sd_previous_up = true;
     sdResetCall();
     if (sd_ready) {
-      playMenu(true);
-      sd_menu_repeat_at = millis() + MENU_REPEAT_MS;
+      const unsigned long lifted_at = millis();
+      while (millis() - lifted_at < SD_PICKUP_PAUSE_MS) {
+        pollDial();
+        if (handsetDown(false) || dial_pending_edges != 0 ||
+            sd_dial_read != sd_dial_write) break;
+        delay(10);
+      }
+      if (!handsetDown(false) && dial_pending_edges == 0 &&
+          sd_dial_read == sd_dial_write) {
+        playMenu(true);
+        sd_menu_repeat_at = millis() + MENU_REPEAT_MS;
+      }
     }
   }
   if (!sd_ready) { delay(100); return; }
@@ -304,7 +380,7 @@ void loopSdPhone() {
   if (sd_dial_read != sd_dial_write) {
     const uint32_t edges = sd_dial_queue[sd_dial_read];
     sd_dial_read = (sd_dial_read + 1) % 8;
-    if (edges == 20) sdHandleDigit(0);
+    if (edges == 20 || edges == 21) sdHandleDigit(0);
     else if (edges >= 2 && edges <= 18 && edges % 2 == 0)
       sdHandleDigit(edges / 2);
     return;

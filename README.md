@@ -46,7 +46,7 @@ cp client/include/network_config.h.example client/include/network_config.h
 pio run -d client -t upload
 ```
 
-For SD mode, put a FAT32 card in the reader, flash the ESP32, and power it from USB or a battery. Messages are `/MSG###.WAV` files on the card. A temporary `/RECORD.TMP` file is removed after a complete recording, after an aborted recording, and on boot. To use a laptop transport instead, start the matching laptop mode. USB mode needs `pyserial` (`python3 -m pip install pyserial`):
+For SD mode, put a FAT32 card in the reader, flash the ESP32, and power it from USB or a battery. New messages are `/secrets_hotline/MSG###.WAV` files on the card. A temporary `/secrets_hotline/RECORD.TMP` file is removed after a complete recording, after an aborted recording, and on boot. To use a laptop transport instead, start the matching laptop mode. USB mode needs `pyserial` (`python3 -m pip install pyserial`):
 
 ```sh
 python3 server/phone.py --connection usb --serial-port /dev/cu.usbserial-0001
@@ -61,11 +61,20 @@ python3 server/phone.py --connection esp32-ap
 
 In shared mode, the laptop listens on TCP port `45679` and the ESP32 connects to it. In ESP32 AP mode, the ESP32 listens at `192.168.4.1:45679` and the laptop connects to it. In USB mode, the same audio commands and replies use serial at 460800 baud. The laptop service reconnects after a lost link. Wi-Fi modes need no Python packages beyond the standard library. For wireless use, keep the ESP32 powered from a wall adapter or power bank. A laptop using the ESP32 network generally needs another connection for internet access.
 
-Put the handset down, then lift it. The phone says “This is the Secrets Hotline” and gives the dial instructions. After 15 seconds of inactivity it repeats only the instructions. Starting to dial skips the rest of the menu. Dial **0** to record a ten-second message, or dial a three-digit key using **1–9** to hear one. A beep marks the beginning and end of recording and follows playback. Hanging up aborts the current action. A missing key can be retried without hanging up.
+Put the handset down, then lift it. In SD mode, the opening prompt waits 1.5 seconds so there is time to raise the handset to your ear. The phone says “This is the Secrets Hotline” and gives the dial instructions. After 15 seconds of inactivity it repeats only the instructions. Starting to dial skips the opening pause or the rest of the menu. Dial **0** to record a message, or dial a three-digit key using **1–9** to hear one. In SD mode, dial **0** again to finish and save the recording; playback stops two seconds before the end to avoid dial noise, while the WAV file keeps the complete audio. The two-minute cap also finishes and saves the full recording and plays it in full. Hanging up during recording discards it. An ascending two-note chime starts recording; a descending chime ends it. A missing key can be retried without hanging up.
 
-In SD mode, all 729 three-digit keys made from 1–9 are considered in a random order, skipping keys already saved on the card. Each key is issued at most once during a power-on run. The laptop server uses its own shuffled key pool in transport modes. Copy the SD card WAV files or `server/data/` to keep saved messages.
+In SD mode, the phone considers three-digit keys made from 1–9 in a random order, skipping keys already saved on the card and the reserved keys **777**, **666**, and **911**. Each key is issued at most once during a power-on run. The laptop server uses its own shuffled key pool in transport modes. Copy the SD card WAV files or `server/data/` to keep saved messages.
 
-The microphone produces 16 kHz, 16-bit mono PCM: 32 KB per second. A ten-second caller message is about 320 KB. In USB mode, recording streams to the laptop as it is captured, and playback uses small chunks paced by the ESP32; neither operation writes the temporary flash file. In either Wi-Fi mode, the ESP32 writes one temporary SPIFFS file while recording, then uploads it. For playback it downloads the whole message into that file before speaking the introduction and playing it. The temporary file is deleted after each operation, after a hang-up or error, and on boot. The laptop saves each message as a WAV file. The reusable speech clips are embedded in firmware flash. Repeated Wi-Fi recordings contribute to flash wear; USB mode avoids that temporary flash write. The client reconnects when the Wi-Fi link or laptop service returns.
+To install an easter egg in SD mode, put a 16 kHz, mono, 16-bit PCM WAV with a 44-byte header on the card for each reserved code. A clip can be up to two minutes long. For example, after obtaining an audio clip, convert it with `ffmpeg`:
+
+```sh
+mkdir -p /Volumes/PHONE/secrets_hotline
+ffmpeg -i clip.mp3 -ar 16000 -ac 1 -c:a pcm_s16le -bitexact /Volumes/PHONE/secrets_hotline/MSG777.WAV
+```
+
+Use `MSG777.WAV`, `MSG666.WAV`, and `MSG911.WAV` for those codes. The files belong in `/secrets_hotline/` on the card. Preloaded clips play at the volume encoded in the WAV; phone recordings retain automatic playback gain. With a reserved file absent, dialing that number gives the usual “no message” response. These SD files do not supply clips to laptop transport modes; that service uses its own `server/data/messages/` files.
+
+The microphone produces 16 kHz, 16-bit mono PCM: 32 KB per second. A full two-minute SD recording is about 3.84 MB. The SD recording stores playback levels in the WAV file as it records, so playback does not need to scan the full message before the introduction. In USB mode, recording streams to the laptop as it is captured, and playback uses small chunks paced by the ESP32; neither operation writes the temporary flash file. In either Wi-Fi mode, the ESP32 writes one temporary SPIFFS file while recording, then uploads it. For playback it downloads the whole message into that file before speaking the introduction and playing it. The temporary file is deleted after each operation, after a hang-up or error, and on boot. The laptop saves each message as a WAV file. The reusable speech clips are embedded in firmware flash. Repeated Wi-Fi recordings contribute to flash wear; USB mode avoids that temporary flash write. The client reconnects when the Wi-Fi link or laptop service returns.
 
 ## Change the voice or menu
 

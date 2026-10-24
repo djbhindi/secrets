@@ -30,9 +30,9 @@ constexpr int PIN_SPEAKER_DATA = 22;
 constexpr int PIN_CRADLE = PHONE_CRADLE_PIN;
 constexpr int PIN_DIAL_RR = 5;
 constexpr uint32_t DIAL_SETTLE_US = 250000;
-// Settled readings on this phone: handset up ~150, down ~3900-4095.
+// Settled readings after the current wiring: handset up ~1000, down ~4095.
 // Ignore intermediate contact readings while the cradle is moving.
-constexpr int CRADLE_UP_BELOW = 500;
+constexpr int CRADLE_UP_BELOW = 1800;
 constexpr int CRADLE_DOWN_ABOVE = 3000;
 constexpr unsigned long CRADLE_UP_SETTLE_MS = 100;
 constexpr unsigned long CRADLE_DOWN_SETTLE_MS = 700;
@@ -162,7 +162,11 @@ void pollCradle(bool report = true) {
   const unsigned long now = millis();
   if (now - cradle_sampled_at < 10) return;
   cradle_sampled_at = now;
-  #if PHONE_CRADLE_PIN == 4
+  #if PHONE_CRADLE_PIN == 4 && PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD
+  int measured = -1;
+  cradle_adc = adc2_get_raw(ADC2_CHANNEL_0, ADC_WIDTH_BIT_12,
+                            &measured) == ESP_OK ? measured : -1;
+  #elif PHONE_CRADLE_PIN == 4
   cradle_adc = digitalRead(PIN_CRADLE) == HIGH ? 4095 : 0;
   #else
   cradle_adc = adc1_get_raw(ADC1_CHANNEL_4);
@@ -219,7 +223,7 @@ bool writeNetworkBytes(const uint8_t *source, size_t count) {
   return sent == count;
 }
 
-bool playBeep();
+bool playBeep(bool ending = false);
 bool playVoiceClip(uint8_t clip_id);
 
 bool writeAudioFile(File &file, const uint8_t *data, size_t count) {
@@ -716,29 +720,51 @@ void playMenu(bool include_intro) {
   else if (cradle_stable == LOW) phone_client.println("ABORTED");
 }
 
-bool playBeep() {
-  constexpr uint32_t BEEP_SAMPLES = RECORD_RATE / 5; // 200 ms
-  uint32_t played = 0;
-  while (played < BEEP_SAMPLES) {
-    if (handsetDown()) {
-      i2s_zero_dma_buffer(SPEAKER_PORT);
-      return false;
+bool playBeep(bool ending) {
+  constexpr float start_frequencies[] = {523.25f, 659.25f};
+  constexpr float end_frequencies[] = {659.25f, 523.25f};
+  const float *frequencies = ending ? end_frequencies : start_frequencies;
+  constexpr uint32_t lengths[] = {RECORD_RATE * 18 / 100,
+                                  RECORD_RATE * 22 / 100};
+  constexpr int amplitudes[] = {3200, 2800};
+  for (unsigned note = 0; note < 2; ++note) {
+    for (uint32_t played = 0; played < lengths[note];) {
+      if (handsetDown()) {
+        i2s_zero_dma_buffer(SPEAKER_PORT);
+        return false;
+      }
+      const size_t frames = min(static_cast<uint32_t>(FRAMES_PER_READ),
+                                lengths[note] - played);
+      for (size_t frame = 0; frame < frames; ++frame) {
+        const uint32_t index = played + frame;
+        const float attack = min(1.0f, index / (RECORD_RATE * .025f));
+        const float release = min(1.0f,
+            (lengths[note] - index) /
+            (RECORD_RATE * (note == 0 ? .08f : .12f)));
+        const int16_t value = static_cast<int16_t>(amplitudes[note] *
+            min(attack, release) *
+            sinf(2.0f * PI * frequencies[note] * index / RECORD_RATE));
+        stereo_chunk[frame * 2] = value;
+        stereo_chunk[frame * 2 + 1] = value;
+      }
+      size_t written = 0;
+      if (i2s_write(SPEAKER_PORT, stereo_chunk, frames * 2 * sizeof(int16_t),
+                    &written, portMAX_DELAY) != ESP_OK ||
+          written != frames * 2 * sizeof(int16_t)) return false;
+      played += frames;
     }
-    const size_t frames = min(static_cast<uint32_t>(FRAMES_PER_READ),
-                              BEEP_SAMPLES - played);
-    for (size_t frame = 0; frame < frames; ++frame) {
-      const uint32_t index = played + frame;
-      const uint32_t edge = min(index, BEEP_SAMPLES - 1 - index);
-      const float fade = min(1.0f, edge / 160.0f);
-      const int16_t value = static_cast<int16_t>(
-          5000 * fade * sinf(2.0f * PI * 1000.0f * index / RECORD_RATE));
-      stereo_chunk[frame * 2] = value;
-      stereo_chunk[frame * 2 + 1] = value;
+    if (note == 0) {
+      memset(stereo_chunk, 0, sizeof(stereo_chunk));
+      for (uint32_t silent = 0; silent < RECORD_RATE / 50;
+           silent += FRAMES_PER_READ) {
+        const size_t frames = min(static_cast<uint32_t>(FRAMES_PER_READ),
+                                  RECORD_RATE / 50 - silent);
+        size_t written = 0;
+        if (i2s_write(SPEAKER_PORT, stereo_chunk, frames * 4,
+                      &written, portMAX_DELAY) != ESP_OK ||
+            written != frames * 4) return false;
+      }
     }
-    size_t written = 0;
-    i2s_write(SPEAKER_PORT, stereo_chunk, frames * 2 * sizeof(int16_t),
-              &written, portMAX_DELAY);
-    played += frames;
   }
   delay(50);
   i2s_zero_dma_buffer(SPEAKER_PORT);
@@ -759,7 +785,14 @@ void setup() {
   PHONE_LOG_PRINTF("Dial RR initial: %s\n",
                 digitalRead(PIN_DIAL_RR) == LOW ? "GROUNDED" : "OPEN");
   pinMode(PIN_CRADLE, INPUT_PULLUP);
-  #if PHONE_CRADLE_PIN == 32
+  #if PHONE_CRADLE_PIN == 4 && PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD
+  adc2_config_channel_atten(ADC2_CHANNEL_0, ADC_ATTEN_DB_12);
+  rtc_gpio_pulldown_dis(GPIO_NUM_4);
+  rtc_gpio_pullup_en(GPIO_NUM_4);
+  int measured = -1;
+  cradle_adc = adc2_get_raw(ADC2_CHANNEL_0, ADC_WIDTH_BIT_12,
+                            &measured) == ESP_OK ? measured : 4095;
+  #elif PHONE_CRADLE_PIN == 32
   adc1_config_width(ADC_WIDTH_BIT_12);
   adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_12);
   rtc_gpio_pulldown_dis(GPIO_NUM_32);
