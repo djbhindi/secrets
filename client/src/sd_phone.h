@@ -42,7 +42,8 @@ unsigned sdKeyAt(uint16_t index) {
 }
 
 bool sdReservedKey(unsigned key) {
-  return key == 420 || key == 666 || key == 777 || key == 911 || key == 999;
+  return key == 404 || key == 420 || key == 666 || key == 777 ||
+         key == 911 || key == 999;
 }
 
 bool sdAllocateKey(unsigned &key) {
