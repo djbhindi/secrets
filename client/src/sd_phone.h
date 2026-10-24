@@ -291,6 +291,7 @@ bool sdPlay(unsigned key) {
       : data_bytes;
   if (!file.seek(44)) { file.close(); return false; }
   if (!playVoiceClip(2)) { file.close(); return false; }
+  broadcastPhoneState(PhoneLightState::Playback);
   uint32_t played = 0;
   while (played < playable_bytes && !handsetDown(false)) {
     const size_t bytes = min(static_cast<uint32_t>(sizeof(recording_file_chunk)),
@@ -326,6 +327,8 @@ bool sdPlay(unsigned key) {
   }
   file.close();
   if (handsetDown(false)) ok = false;
+  broadcastPhoneState(cradle_stable == LOW ? PhoneLightState::Down
+                                           : PhoneLightState::Up);
   delay(50);
   i2s_zero_dma_buffer(SPEAKER_PORT);
   PHONE_LOG_PRINTF("SD playback: %s, mean %ld, gain %.2f, %s\n", path,
@@ -361,7 +364,10 @@ void sdHandleDigit(unsigned digit) {
     unsigned key = 0;
     if (!sdAllocateKey(key)) { playVoiceClip(1); return; }
     if (!playVoiceClip(0) || !playBeep()) return;
+    broadcastPhoneState(PhoneLightState::Recording);
     const SdRecordResult result = sdRecord(key);
+    broadcastPhoneState(cradle_stable == LOW ? PhoneLightState::Down
+                                             : PhoneLightState::Up);
     if (result == SdRecordResult::Failed || result == SdRecordResult::HungUp) {
       sd_record_failed_until_hangup = true;
       if (result == SdRecordResult::Failed && !handsetDown(false))
@@ -404,6 +410,8 @@ void setupSdPhone() {
   sd_next_key = esp_random() % 729;
   do { sd_key_stride = 1 + esp_random() % 728; } while (sd_key_stride % 3 == 0);
   sd_previous_up = cradle_stable == HIGH;
+  broadcastPhoneState(sd_previous_up ? PhoneLightState::Up
+                                    : PhoneLightState::Down);
   PHONE_LOG_PRINTF("SD phone: %s; card %llu MB; free %llu MB; free heap %u\n",
                    sd_ready ? "ready" : "mount failed",
                    sd_ready ? SD.cardSize() / (1024ULL * 1024ULL) : 0,
@@ -413,6 +421,7 @@ void setupSdPhone() {
 }
 
 void loopSdPhone() {
+  tickStatusBroadcast();
   if (!sd_ready && millis() - sd_mount_attempt_at >= 3000) {
     sd_mount_attempt_at = millis();
     SD.end();
@@ -430,6 +439,7 @@ void loopSdPhone() {
   pollDial();
   const bool up = cradle_stable == HIGH;
   if (!up) {
+    broadcastPhoneState(PhoneLightState::Down);
     if (sd_previous_up) sdResetCall();
     sd_previous_up = false;
     delay(10);
@@ -438,6 +448,7 @@ void loopSdPhone() {
   if (!sd_previous_up) {
     sd_previous_up = true;
     sdResetCall();
+    broadcastPhoneState(PhoneLightState::Up);
     if (sd_ready) {
       const unsigned long lifted_at = millis();
       while (millis() - lifted_at < SD_PICKUP_PAUSE_MS) {

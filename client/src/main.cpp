@@ -12,6 +12,7 @@
 #include "prompt_pcm.h"
 #include "voice_adpcm.h"
 #include "phone_transport.h"
+#include "status_broadcast.h"
 
 #ifndef PHONE_CRADLE_PIN
 #define PHONE_CRADLE_PIN 32
@@ -203,6 +204,7 @@ void pollCradle(bool report = true) {
 
 bool handsetDown(bool report = true) {
   pollCradle(report);
+  tickStatusBroadcast();
   return cradle_stable == LOW;
 }
 
@@ -869,6 +871,7 @@ void setup() {
   i2s_zero_dma_buffer(SPEAKER_PORT);
 #if PHONE_CONNECTION_MODE == PHONE_CONNECTION_SD
   setupSdPhone();
+  beginStatusBroadcast();
 #else
   if (!SPIFFS.begin(true)) {
     PHONE_LOG_PRINTLN("Temporary audio storage unavailable");

@@ -1,10 +1,11 @@
 # Wireless rotary phone message system
 
-The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone, and drives a MAX98357A amplifier. Select standalone SD card, USB serial, shared 2.4 GHz Wi-Fi, or an ESP32-hosted Wi-Fi network. The opening menu and reusable Cori speech clips are stored in ESP32 flash and play locally. In standalone mode, caller messages are saved as WAV files on the microSD card; no laptop service or Wi-Fi is needed.
+The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone, and drives a MAX98357A amplifier. Select standalone SD card, USB serial, shared 2.4 GHz Wi-Fi, or an ESP32-hosted Wi-Fi network. The opening menu and reusable Cori speech clips are stored in ESP32 flash and play locally. In SD mode, caller messages are saved as WAV files on the microSD card; no laptop service or existing Wi-Fi network is needed. When status lights are enabled, the main ESP32 hosts a private network for the second ESP32.
 
 ## Layout
 
 - `client/`: PlatformIO ESP32 firmware. The opening menu and reusable speech clips are embedded in flash.
+- `client/src/light_controller.cpp`: Second ESP32 firmware for WS2811 status lights.
 - `server/`: Laptop program and source WAV clips used to build the firmware. Messages are saved to `server/data/messages/`, which Git ignores.
 - `scripts/`: Optional tools to regenerate the voice and menu assets.
 - `tests/`: Laptop program tests.
@@ -22,6 +23,8 @@ The ESP32 reads the phone's cradle and dial, captures an SPH0645LM4H microphone,
 | Rotary dial | F, RR | GND, GPIO5 |
 | SD card reader | GND, VCC | GND, VIN (5V, for this reader with an onboard regulator) |
 | SD card reader | MISO, MOSI, SCK, CS | GPIO19, GPIO23, GPIO18, GPIO13 |
+
+The separate light controller uses GPIO13 for the WS2811 data input and is configured for 50 pixels. Power the 5 V lights from a supply sized for the strip, and connect that supply's ground to the second ESP32's ground. It starts in orange (down) and remains there until it receives a phone state. The states are orange (down), yellow (up), red (recording), and warm purple (message playback), each with nearby hues, gentle breathing, and a smooth transition. Use `pio run -d client -e light-controller -t upload` to flash the second board. On its 115200-baud serial console, send `0`, `1`, `2`, or `3` to test a state; send `a` for an optional four-state demo cycle. It joins the main phone's private Wi-Fi network named by `PHONE_AP_SSID` in the ignored `network_config.h` and receives `down`, `up`, `recording`, or `playback` UDP packets on port 45680. If the state signal stops, it returns to orange. The main phone creates this network with `PHONE_STATUS_LIGHTS=1` in its config; move its cradle sense wire from GPIO4 to GPIO32 and set `PHONE_CRADLE_PIN=32` before enabling this. Its existing cradle thresholds and call flow stay the same.
 
 Set `PHONE_CRADLE_PIN` in `client/include/network_config.h` to match the cradle wire. The example uses GPIO4, matching this phone's original wiring. That mode senses a digital high/low level because Wi-Fi prevents ADC2 readings on the original ESP32. GPIO32 is available for ADC1 sensing if the wire is moved. Verify both handset positions after flashing. The other cradle wire stays on GND. Connect the speaker to both amplifier output terminals, never to ESP32 GPIO or GND. All devices share a ground. GPIO5 is a startup strapping pin, so verify the board still boots with the dial connected.
 
