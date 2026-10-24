@@ -1,6 +1,7 @@
 """Generate every reusable Cori speech clip before running the phone service."""
 
 from pathlib import Path
+import argparse
 import wave
 
 import numpy as np
@@ -10,7 +11,7 @@ from voice import DEFAULT_MODEL, RATE, ROOT, render_16k, soften_low_mids
 
 
 PHRASES = {
-    "record_after_beep": "Record a message up to two minutes long after the beep, or dial zero when you're done.",
+    "record_after_beep": "Record a message up to two minutes long. After the beep, dial zero when you're done.",
     "store_full": "The message store is full.",
     "here_message": "Here is your message.",
     "your_code": "Your message is saved. Your three digit code is",
@@ -18,7 +19,12 @@ PHRASES = {
     "you_dialed": "You dialed",
     "no_message": "There is no message for that code. Please try again.",
 }
-DIGITS = dict(zip("123456789", "one two three four five six seven eight nine".split()))
+DIGITS = dict(zip("1234567890", "one two three four five six seven eight nine zero".split()))
+
+
+def recording_prompt(voice):
+    """Speak the recording instructions as one natural sentence."""
+    return render_16k(PHRASES["record_after_beep"], voice, lead_silence_ms=0)
 
 
 def contextual_eight():
@@ -36,13 +42,23 @@ def contextual_eight():
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--only", nargs="+", help="Regenerate only these clip names")
+    selected = parser.parse_args().only
     voice = PiperVoice.load(str(DEFAULT_MODEL))
     destination = ROOT / "server" / "assets" / "voice"
     destination.mkdir(parents=True, exist_ok=True)
     phrases = dict(PHRASES)
     phrases.update({f"digit_{digit}": word for digit, word in DIGITS.items()})
+    if selected:
+        unknown = set(selected) - set(phrases)
+        if unknown:
+            parser.error(f"Unknown clips: {', '.join(sorted(unknown))}")
+        phrases = {name: words for name, words in phrases.items() if name in selected}
     for name, words in phrases.items():
-        if name == "digit_8":
+        if name == "record_after_beep":
+            raw = recording_prompt(voice)
+        elif name == "digit_8":
             raw = contextual_eight()
         else:
             raw = render_16k(words, voice, lead_silence_ms=0)

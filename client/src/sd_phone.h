@@ -8,10 +8,11 @@ constexpr uint32_t SD_RECORD_SAMPLES = RECORD_RATE * 120;
 constexpr uint32_t SD_DIAL_END_TRIM_SAMPLES = RECORD_RATE * 2;
 constexpr unsigned long SD_PICKUP_PAUSE_MS = 1500;
 constexpr unsigned long SD_CODE_TIMEOUT_MS = 30000;
-constexpr unsigned long MENU_REPEAT_MS = 15000;
+constexpr unsigned long MENU_REPEAT_MS = 10000;
 bool sd_ready = false;
 unsigned long sd_mount_attempt_at = 0;
 bool sd_previous_up = false;
+bool sd_record_failed_until_hangup = false;
 unsigned long sd_menu_repeat_at = 0;
 char sd_entered[4] = {};
 uint8_t sd_entered_count = 0;
@@ -34,6 +35,51 @@ bool sdPrepareCard() {
   if (!SD.exists(SD_RECORDING_DIR) && !SD.mkdir(SD_RECORDING_DIR)) return false;
   if (SD.exists(SD_TEMP_FILE)) SD.remove(SD_TEMP_FILE);
   return true;
+}
+
+// Small writes leave the card free to finish a block before we retry it.
+// A zero-byte write is sometimes a short SD busy period, not a lost card.
+bool sdWriteAudioFile(File &file, const uint8_t *data, size_t count) {
+  size_t written = 0;
+  unsigned stalls = 0;
+  while (written < count) {
+    const size_t bytes = file.write(data + written,
+                                    min(static_cast<size_t>(512), count - written));
+    if (bytes == 0) {
+      if (++stalls >= 20) {
+        PHONE_LOG_PRINTF("SD write stalled at %u/%u bytes\n",
+                         static_cast<unsigned>(written),
+                         static_cast<unsigned>(count));
+        return false;
+      }
+      delay(5);
+      continue;
+    }
+    written += bytes;
+    stalls = 0;
+  }
+  return true;
+}
+
+void sdPlayErrorTone() {
+  constexpr uint32_t duration = RECORD_RATE * 35 / 100;
+  for (uint32_t played = 0; played < duration && !handsetDown(false);) {
+    const size_t frames = min(static_cast<uint32_t>(FRAMES_PER_READ),
+                              duration - played);
+    for (size_t i = 0; i < frames; ++i) {
+      const uint32_t position = played + i;
+      const float envelope = min(1.0f, min(position, duration - position) / 320.0f);
+      const int16_t value = static_cast<int16_t>(2200 * envelope *
+          sinf(2.0f * PI * 220.0f * position / RECORD_RATE));
+      stereo_chunk[2 * i] = value;
+      stereo_chunk[2 * i + 1] = value;
+    }
+    size_t written = 0;
+    if (i2s_write(SPEAKER_PORT, stereo_chunk, frames * 4, &written,
+                  portMAX_DELAY) != ESP_OK || written != frames * 4) break;
+    played += frames;
+  }
+  i2s_zero_dma_buffer(SPEAKER_PORT);
 }
 
 unsigned sdKeyAt(uint16_t index) {
@@ -93,10 +139,14 @@ enum class SdRecordResult { Failed, TimedOut, DialEnded, HungUp };
 SdRecordResult sdRecord(unsigned key) {
   if (SD.exists(SD_TEMP_FILE)) SD.remove(SD_TEMP_FILE);
   File file = SD.open(SD_TEMP_FILE, FILE_WRITE);
-  if (!file) return SdRecordResult::Failed;
+  if (!file) {
+    PHONE_LOG_PRINTLN("SD capture failed: open temporary file");
+    return SdRecordResult::Failed;
+  }
   uint8_t header[44];
   sdWavHeader(header, 0);
   bool ok = file.write(header, sizeof(header)) == sizeof(header);
+  const char *failure = ok ? "none" : "write WAV header";
   uint32_t captured = 0;
   size_t buffered = 0;
   int32_t minimum = 32767;
@@ -117,7 +167,7 @@ SdRecordResult sdRecord(unsigned key) {
     if (dial_ended) break;
     size_t bytes_read = 0;
     if (i2s_read(I2S_PORT, samples, sizeof(samples), &bytes_read,
-                 portMAX_DELAY) != ESP_OK) { ok = false; break; }
+                 portMAX_DELAY) != ESP_OK) { ok = false; failure = "microphone read"; break; }
     const size_t frames = bytes_read / (2 * sizeof(int32_t));
     size_t count = 0;
     for (size_t frame = 0; frame + 1 < frames &&
@@ -126,7 +176,7 @@ SdRecordResult sdRecord(unsigned key) {
       const int32_t b = samples[(frame + 1) * 2] >> 16;
       recording_chunk[count++] = static_cast<int16_t>((a + b) / 2);
     }
-    if (count == 0) { ok = false; break; }
+    if (count == 0) { ok = false; failure = "empty microphone block"; break; }
     for (size_t i = 0; i < count; ++i) {
       if (captured + i < RECORD_RATE * 15 / 100) continue;
       const int32_t value = recording_chunk[i];
@@ -137,7 +187,8 @@ SdRecordResult sdRecord(unsigned key) {
     }
     const size_t bytes = count * sizeof(int16_t);
     if (buffered + bytes > sizeof(recording_file_chunk)) {
-      ok = writeAudioFile(file, recording_file_chunk, buffered);
+      ok = sdWriteAudioFile(file, recording_file_chunk, buffered);
+      if (!ok) failure = "write audio block";
       buffered = 0;
     }
     if (!ok) break;
@@ -146,7 +197,8 @@ SdRecordResult sdRecord(unsigned key) {
     captured += count;
     if (buffered == sizeof(recording_file_chunk) ||
         captured == SD_RECORD_SAMPLES) {
-      ok = writeAudioFile(file, recording_file_chunk, buffered);
+      ok = sdWriteAudioFile(file, recording_file_chunk, buffered);
+      if (!ok) failure = "write audio block";
       buffered = 0;
     }
   }
@@ -154,8 +206,13 @@ SdRecordResult sdRecord(unsigned key) {
   PHONE_LOG_PRINTF("SD stop: dial=%u, down=%u, adc=%d, write=%u, samples=%lu\n",
                    dial_ended, hung_up, cradle_adc, ok,
                    static_cast<unsigned long>(captured));
-  if (ok && buffered != 0) ok = writeAudioFile(file, recording_file_chunk, buffered);
+  if (ok && buffered != 0) {
+    ok = sdWriteAudioFile(file, recording_file_chunk, buffered);
+    if (!ok) failure = "write final audio block";
+  }
   ok = ok && captured != 0 && !hung_up;
+  if (hung_up) failure = "handset down";
+  else if (captured == 0 && strcmp(failure, "none") == 0) failure = "no samples";
   if (ok) {
     const int32_t mean = measured ? lround(static_cast<double>(sum) / measured) : 0;
     const int32_t peak = measured ? max(abs(minimum - mean), abs(maximum - mean)) : 0;
@@ -166,21 +223,25 @@ SdRecordResult sdRecord(unsigned key) {
     memcpy(levels + 8, &mean, 4);
     memcpy(levels + 12, &peak, 4);
     ok = file.write(levels, sizeof(levels)) == sizeof(levels);
+    if (!ok) failure = "write levels";
   }
   if (ok) {
     sdWavHeader(header, captured);
     ok = file.seek(0) && file.write(header, sizeof(header)) == sizeof(header);
+    if (!ok) failure = "rewrite WAV header";
   }
   file.close();
   if (ok) {
     char path[32]; sdFileName(key, path);
     ok = SD.rename(SD_TEMP_FILE, path);
+    if (!ok) failure = "rename recording";
   }
   if (!ok) SD.remove(SD_TEMP_FILE);
-  PHONE_LOG_PRINTF("SD capture: %lu samples, %lu ms, %s; down=%u, dial=%u\n",
+  PHONE_LOG_PRINTF("SD capture: %lu samples, %lu ms, %s; down=%u, dial=%u, reason=%s, free=%llu MB\n",
       static_cast<unsigned long>(captured),
       static_cast<unsigned long>(millis() - started), ok ? "saved" : "aborted",
-      hung_up, dial_ended);
+      hung_up, dial_ended, failure,
+      (SD.totalBytes() - SD.usedBytes()) / (1024ULL * 1024ULL));
   if (!ok) return hung_up ? SdRecordResult::HungUp : SdRecordResult::Failed;
   return dial_ended ? SdRecordResult::DialEnded : SdRecordResult::TimedOut;
 }
@@ -273,10 +334,14 @@ bool sdPlay(unsigned key) {
   return ok;
 }
 
+uint8_t sdDigitClip(unsigned digit) {
+  return digit == 0 ? VOICE_CLIP_COUNT - 1 : 7 + digit - 1;
+}
+
 bool sdSpeakKey(unsigned key) {
-  return playVoiceClip(7 + key / 100 - 1) &&
-         playVoiceClip(7 + (key / 10) % 10 - 1) &&
-         playVoiceClip(7 + key % 10 - 1);
+  return playVoiceClip(sdDigitClip(key / 100)) &&
+         playVoiceClip(sdDigitClip((key / 10) % 10)) &&
+         playVoiceClip(sdDigitClip(key % 10));
 }
 
 void sdResetCall() {
@@ -285,18 +350,24 @@ void sdResetCall() {
   sd_code_started_at = 0;
   sd_menu_repeat_at = 0;
   sd_dial_read = sd_dial_write;
+  sd_record_failed_until_hangup = false;
   i2s_zero_dma_buffer(SPEAKER_PORT);
 }
 
 void sdHandleDigit(unsigned digit) {
   sd_menu_repeat_at = 0;
   if (digit == 0 && sd_entered_count == 0) {
+    if (sd_record_failed_until_hangup) return;
     unsigned key = 0;
     if (!sdAllocateKey(key)) { playVoiceClip(1); return; }
     if (!playVoiceClip(0) || !playBeep()) return;
     const SdRecordResult result = sdRecord(key);
-    if (result == SdRecordResult::Failed || result == SdRecordResult::HungUp)
+    if (result == SdRecordResult::Failed || result == SdRecordResult::HungUp) {
+      sd_record_failed_until_hangup = true;
+      if (result == SdRecordResult::Failed && !handsetDown(false))
+        sdPlayErrorTone();
       return;
+    }
     if (!playBeep(true)) {
       char path[32]; sdFileName(key, path);
       SD.remove(path);
@@ -307,8 +378,8 @@ void sdHandleDigit(unsigned digit) {
     sdSpeakKey(key);
     return;
   }
-  if (sd_entered_count == 0) sd_code_started_at = millis();
-  if (digit != 0 && !playVoiceClip(7 + digit - 1)) return;
+  sd_code_started_at = millis();
+  if (!playVoiceClip(sdDigitClip(digit))) return;
   sd_entered[sd_entered_count++] = '0' + digit;
   if (sd_entered_count != 3) return;
   sd_entered[3] = 0;
@@ -319,10 +390,7 @@ void sdHandleDigit(unsigned digit) {
   if (sdMessageExists(key)) {
     if (sdPlay(key)) playBeep();
   } else {
-    // The spoken digit clips cover 1-9; a missing code containing 0 gets
-    // the generic response instead of announcing the wrong digit.
-    if (key % 10 == 0 || (key / 10) % 10 == 0) playVoiceClip(6);
-    else if (playVoiceClip(5) && sdSpeakKey(key)) playVoiceClip(6);
+    if (playVoiceClip(5) && sdSpeakKey(key)) playVoiceClip(6);
   }
 }
 
@@ -336,9 +404,11 @@ void setupSdPhone() {
   sd_next_key = esp_random() % 729;
   do { sd_key_stride = 1 + esp_random() % 728; } while (sd_key_stride % 3 == 0);
   sd_previous_up = cradle_stable == HIGH;
-  PHONE_LOG_PRINTF("SD phone: %s; card %llu MB; free heap %u\n",
+  PHONE_LOG_PRINTF("SD phone: %s; card %llu MB; free %llu MB; free heap %u\n",
                    sd_ready ? "ready" : "mount failed",
                    sd_ready ? SD.cardSize() / (1024ULL * 1024ULL) : 0,
+                   sd_ready ? (SD.totalBytes() - SD.usedBytes()) /
+                                  (1024ULL * 1024ULL) : 0,
                    ESP.getFreeHeap());
 }
 
@@ -385,22 +455,22 @@ void loopSdPhone() {
   }
   if (!sd_ready) { delay(100); return; }
   pollDial();
-  if (sd_entered_count && millis() - sd_code_started_at >= SD_CODE_TIMEOUT_MS) {
-    sd_entered_count = 0;
-    sd_entered[0] = 0;
-    sd_code_started_at = 0;
-    sd_dial_read = sd_dial_write;
-    dial_turn_at_lift = dial_turn_id;
-    playMenu(false);
-    sd_menu_repeat_at = millis() + MENU_REPEAT_MS;
-    return;
-  }
   if (sd_dial_read != sd_dial_write) {
     const uint32_t edges = sd_dial_queue[sd_dial_read];
     sd_dial_read = (sd_dial_read + 1) % 8;
     if (edges == 20 || edges == 21) sdHandleDigit(0);
     else if (edges >= 2 && edges <= 18 && edges % 2 == 0)
       sdHandleDigit(edges / 2);
+    return;
+  }
+  if (sd_entered_count && dial_pending_edges == 0 &&
+      millis() - sd_code_started_at >= SD_CODE_TIMEOUT_MS) {
+    sd_entered_count = 0;
+    sd_entered[0] = 0;
+    sd_code_started_at = 0;
+    dial_turn_at_lift = dial_turn_id;
+    playMenu(false);
+    sd_menu_repeat_at = millis() + MENU_REPEAT_MS;
     return;
   }
   if (sd_menu_repeat_at && static_cast<int32_t>(millis() - sd_menu_repeat_at) >= 0) {

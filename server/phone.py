@@ -15,7 +15,7 @@ import wave
 
 RATE = 16000
 RECORD_SECONDS = 10
-MENU_REPEAT_SECONDS = 15
+MENU_REPEAT_SECONDS = 10
 HEARTBEAT_SECONDS = 5
 HEARTBEAT_TIMEOUT_SECONDS = 3
 PLAY_CHUNK_BYTES = 1024 * 2
@@ -27,7 +27,7 @@ TRIGGER = re.compile(r"^TRIGGER \(20 edges; turn (\d+)\)$")
 SERVER_DIR = Path(__file__).resolve().parent
 VOICE_CLIPS = ("record_after_beep", "store_full", "here_message",
                "your_code", "repeat", "you_dialed", "no_message",
-               *(f"digit_{digit}" for digit in DIGITS))
+               *(f"digit_{digit}" for digit in DIGITS), "digit_0")
 
 
 class Hangup(Exception):
