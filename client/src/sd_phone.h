@@ -7,6 +7,7 @@ constexpr char SD_TEMP_FILE[] = "/secrets_hotline/RECORD.TMP";
 constexpr uint32_t SD_RECORD_SAMPLES = RECORD_RATE * 120;
 constexpr uint32_t SD_DIAL_END_TRIM_SAMPLES = RECORD_RATE * 2;
 constexpr unsigned long SD_PICKUP_PAUSE_MS = 1500;
+constexpr unsigned long SD_CODE_TIMEOUT_MS = 30000;
 constexpr unsigned long MENU_REPEAT_MS = 15000;
 bool sd_ready = false;
 unsigned long sd_mount_attempt_at = 0;
@@ -14,6 +15,7 @@ bool sd_previous_up = false;
 unsigned long sd_menu_repeat_at = 0;
 char sd_entered[4] = {};
 uint8_t sd_entered_count = 0;
+unsigned long sd_code_started_at = 0;
 bool sd_issued[729] = {};
 uint16_t sd_next_key = 0;
 uint16_t sd_key_stride = 1;
@@ -40,7 +42,7 @@ unsigned sdKeyAt(uint16_t index) {
 }
 
 bool sdReservedKey(unsigned key) {
-  return key == 777 || key == 666 || key == 911;
+  return key == 420 || key == 666 || key == 777 || key == 911 || key == 999;
 }
 
 bool sdAllocateKey(unsigned &key) {
@@ -279,6 +281,7 @@ bool sdSpeakKey(unsigned key) {
 void sdResetCall() {
   sd_entered_count = 0;
   sd_entered[0] = 0;
+  sd_code_started_at = 0;
   sd_menu_repeat_at = 0;
   sd_dial_read = sd_dial_write;
   i2s_zero_dma_buffer(SPEAKER_PORT);
@@ -286,8 +289,7 @@ void sdResetCall() {
 
 void sdHandleDigit(unsigned digit) {
   sd_menu_repeat_at = 0;
-  if (digit == 0) {
-    sd_entered_count = 0;
+  if (digit == 0 && sd_entered_count == 0) {
     unsigned key = 0;
     if (!sdAllocateKey(key)) { playVoiceClip(1); return; }
     if (!playVoiceClip(0) || !playBeep()) return;
@@ -304,17 +306,22 @@ void sdHandleDigit(unsigned digit) {
     sdSpeakKey(key);
     return;
   }
-  if (!playVoiceClip(7 + digit - 1)) return;
+  if (sd_entered_count == 0) sd_code_started_at = millis();
+  if (digit != 0 && !playVoiceClip(7 + digit - 1)) return;
   sd_entered[sd_entered_count++] = '0' + digit;
   if (sd_entered_count != 3) return;
   sd_entered[3] = 0;
   const unsigned key = (sd_entered[0] - '0') * 100 +
                        (sd_entered[1] - '0') * 10 + sd_entered[2] - '0';
   sd_entered_count = 0;
+  sd_code_started_at = 0;
   if (sdMessageExists(key)) {
     if (sdPlay(key)) playBeep();
   } else {
-    if (playVoiceClip(5) && sdSpeakKey(key)) playVoiceClip(6);
+    // The spoken digit clips cover 1-9; a missing code containing 0 gets
+    // the generic response instead of announcing the wrong digit.
+    if (key % 10 == 0 || (key / 10) % 10 == 0) playVoiceClip(6);
+    else if (playVoiceClip(5) && sdSpeakKey(key)) playVoiceClip(6);
   }
 }
 
@@ -377,6 +384,16 @@ void loopSdPhone() {
   }
   if (!sd_ready) { delay(100); return; }
   pollDial();
+  if (sd_entered_count && millis() - sd_code_started_at >= SD_CODE_TIMEOUT_MS) {
+    sd_entered_count = 0;
+    sd_entered[0] = 0;
+    sd_code_started_at = 0;
+    sd_dial_read = sd_dial_write;
+    dial_turn_at_lift = dial_turn_id;
+    playMenu(false);
+    sd_menu_repeat_at = millis() + MENU_REPEAT_MS;
+    return;
+  }
   if (sd_dial_read != sd_dial_write) {
     const uint32_t edges = sd_dial_queue[sd_dial_read];
     sd_dial_read = (sd_dial_read + 1) % 8;
